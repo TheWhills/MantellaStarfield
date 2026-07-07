@@ -24,6 +24,9 @@
 #include <vector>
 #include <mutex>
 
+#include "UnityComm.h"
+#include "UnityChat.h"
+
 #pragma comment(lib, "winhttp.lib")
 
 static const char* BRIDGE_DIR = "E:\\Star Wars Genesis\\Game\\overwrite\\SFSE\\MantellaStarfield\\";
@@ -166,6 +169,13 @@ int ReadQueueWriteIndex()
 {
     std::string v = ReadQueueValue("queue", "write_index", "0");
     try { return std::stoi(v); } catch (...) { return 0; }
+}
+
+bool ReadQueueTurnDone()
+{
+    std::string v = ReadQueueValue("queue", "turn_done", "0");
+    std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+    return v == "1" || v == "true" || v == "yes";
 }
 
 std::string EscapeJson(const std::string& input)
@@ -390,146 +400,157 @@ void PlayQueuedLine(int idx)
     std::string wemPath  = ReadQueueValue(sec.c_str(), "wem_path", "");
     std::string subtitle = ReadQueueValue(sec.c_str(), "subtitle", "");
     std::string durStr   = ReadQueueValue(sec.c_str(), "duration", "2.0");
-    float duration = 2.0f;
-    try { duration = std::stof(durStr); } catch (...) {}
 
-    SetCurrentWemPath(wemPath);     // hook redirect target for this line
-    ActivateLipsForCurrentLine();   // copy this line's ffxanim onto 00666A79
-    if (!subtitle.empty()) PatchDialogueSubtitle(subtitle);
+    float duration = 2.0f;
+    try {
+        duration = std::stof(durStr);
+    }
+    catch (...) {
+        duration = 2.0f;
+    }
+
+    // Tell the path hook which WEM to redirect to.
+    SetCurrentWemPath(wemPath);
+
+    // Copy this line's generated .ffxanim onto the shared runtime
+    // 00666A79.ffxanim file right before the scene starts.
+    ActivateLipsForCurrentLine();
+
+    if (!subtitle.empty()) {
+        PatchDialogueSubtitle(subtitle);
+    }
 
     // Buffer added to the line's duration before advancing. Covers two timing
     // offsets that otherwise let the NEXT line's lip activation overwrite the
-    // shared 00666A79.ffxanim slot before THIS line's audio finishes (which
-    // shows as the lips drifting off at a long line's tail):
-    //   1) Wwise starts the wem ~150-500ms AFTER we begin the line.
-    //   2) Mantella's wait_time_buffer=-1.0 makes durations read slightly short.
+    // shared 00666A79.ffxanim slot before THIS line's audio finishes.
     static const int PLAYBACK_BUFFER_MS = 700;
+
     int waitMs = static_cast<int>(duration * 1000.0f) + PLAYBACK_BUFFER_MS;
+
     REX::INFO("Mantella: Playing line {} (duration={}s)", idx, duration);
+
     WriteSpeakingState(duration);
+
     std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+
     WritePrivateProfileStringA("speaking", "active", "0", BRIDGE_INI);
 }
 
+// UNITY conversation loop.
+//
+// Differs fundamentally from the Mantella pull model: UNITYServer STREAMS every
+// line of a turn back at once in response to a single inputtext request. The
+// plugin fires that request (SendUnityConversation, which streams and appends
+// pending lines to UnityWork.ini), and the Python generator fetches each wav,
+// builds the wem, deploys it, and writes the [line_N] into MantellaQueue.ini.
+//
+// So this loop does NOT request lines. It only:
+//   - plays line_{localRead} as write_index grows (Python-driven),
+//   - decides a turn is "done" when no new line has appeared for a grace period,
+//   - then awaits the next player_input (fires a fresh stream) or end.
+//
+// The play mechanics (PlayQueuedLine, read_index persistence, speaking flags)
+// and the per-turn queue reset are preserved exactly from the Mantella version.
 void RunConversationLoop(const std::string& startNonce)
 {
     std::string lastNonce = startNonce;
-    // How many lines to keep requested ahead of what we've played. The queue
-    // buffers them, so by the time we finish line N, line N+1 is already there.
-    // Lower = first line plays sooner (less waiting before playback starts);
-    // higher = more buffer for later lines. 2 balances first-line latency
-    // against keeping the tail seamless.
-    const int PREFETCH_AHEAD = 2;
+    int localRead = 0;                 // next line index C++ will play
+    bool awaitingPlayerInput = true;   // no auto greeting; first G opens input
+    bool awaitPromptWritten = false;
 
-    int localRead = 0;          // next line index WE will play
-    bool turnDone = false;      // Mantella signalled player_talk/end for this turn
-    std::string pendingStop;    // "player_talk" / "end" once turnDone
+    REX::INFO("UNITY: Conversation loop started (explicit state machine)");
 
-    REX::INFO("Mantella: Getting NPC greeting");
-    // Fresh queue for this conversation (clear any stale lines from a prior run).
-    {
+    auto ResetQueueForNewTurn = []() {
         std::ofstream qf(QUEUE_INI, std::ios::trunc);
-        qf << "[queue]\nwrite_index=0\nread_index=0\n";
-    }
+        qf << "[queue]\nwrite_index=0\nread_index=0\nturn_done=0\n";
+    };
+
+    // Fresh queue for this conversation. Python writes [line_N] and sets
+    // [queue] turn_done=1 only after UnityChat appends __ENDTURN__.
+    ResetQueueForNewTurn();
 
     while (g_conversationActive) {
-        // ---- 1) REQUEST AHEAD --------------------------------------------
-        // Pull lines from Mantella until the queue is PREFETCH_AHEAD past
-        // playback, or until Mantella says the turn is over. Each request makes
-        // Python generate + enqueue one [line_N]; the reply tells us what kind.
-        // We pace off the actual on-disk writeIndex (source of truth) so a line
-        // that failed to enqueue can't make us over-request and stall.
-        while (!turnDone && (ReadQueueWriteIndex() - localRead) < PREFETCH_AHEAD) {
-            std::string resp = SendToMantella(BuildContinueJson());
-            std::string rt = GetReplyType(resp);
-            if (rt == "mantella_npc_talk") {
-                REX::INFO("Mantella: Requested line (write_index now {})", ReadQueueWriteIndex());
+        // -----------------------------------------------------------------
+        // STATE A: Await player input
+        // -----------------------------------------------------------------
+        // This state is used at conversation start and after each NPC turn is
+        // fully played. Do not wait for turn_done here; there is no Unity turn
+        // in flight yet. We only move to playback after a real player_input.
+        if (awaitingPlayerInput) {
+            if (!awaitPromptWritten) {
+                g_mantellaSpeaking.store(false);
+                WriteAwaitInput(lastNonce);
+                awaitPromptWritten = true;
             }
-            else if (rt == "mantella_player_talk") {
-                turnDone = true; pendingStop = "player_talk";
-                REX::INFO("Mantella: Turn done -> player_talk");
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+            std::string currentNonce = ReadIniValue("request", "nonce", "");
+            std::string currentType = ReadIniValue("request", "type", "");
+            std::transform(currentType.begin(), currentType.end(), currentType.begin(), ::tolower);
+
+            if (currentNonce.empty() || currentNonce == lastNonce) {
+                continue;
             }
-            else if (rt == "mantella_end_conversation") {
-                turnDone = true; pendingStop = "end";
-                REX::INFO("Mantella: Turn done -> end");
+
+            lastNonce = currentNonce;
+
+            if (currentType == "end") {
+                REX::INFO("UNITY: Player ended conversation");
+                g_conversationActive = false;
+                g_mantellaSpeaking.store(false);
+                return;
             }
-            else {
-                // Unknown/empty — brief wait, don't spin.
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                break;
+
+            if (currentType == "player_input") {
+                std::string playerInput = ReadIniValue("request", "player_input", "");
+                std::string speaker = ReadIniValue("request", "speaker", "Unknown");
+                REX::INFO("UNITY: Player said: {}", playerInput);
+
+                ResetQueueForNewTurn();
+                localRead = 0;
+
+                std::string decoded = playerInput;
+                std::replace(decoded.begin(), decoded.end(), '_', ' ');
+
+                awaitingPlayerInput = false;
+                awaitPromptWritten = false;
+
+                SendUnityConversation(speaker, decoded, 1);
+                continue;
             }
+
+            // Ignore other bridge states while awaiting input.
+            continue;
         }
 
-        // ---- 2) PLAY NEXT QUEUED LINE ------------------------------------
-        // Play strictly line_{localRead} when it exists in the queue. The index
-        // IS the identity, so we can never grab the wrong or a stale line.
+        // -----------------------------------------------------------------
+        // STATE B: Play / wait for the current Unity turn
+        // -----------------------------------------------------------------
+        // UnityChat is streaming lines to UnityWork.ini, Python is converting
+        // them to WEMs and writing MantellaQueue.ini, and Python sets turn_done
+        // after it sees __ENDTURN__. We play lines as soon as they appear and
+        // only return to input once the stream is done AND the queue is drained.
         int writeIndex = ReadQueueWriteIndex();
         if (localRead < writeIndex) {
             g_mantellaSpeaking.store(true);
             PlayQueuedLine(localRead);
             localRead++;
-            // Persist read_index for visibility/debug (C++ is sole writer here).
             WritePrivateProfileStringA("queue", "read_index",
                 std::to_string(localRead).c_str(), QUEUE_INI);
             g_mantellaSpeaking.store(false);
-            continue;  // loop back: request more, play more
-        }
-
-        // ---- 3) QUEUE DRAINED --------------------------------------------
-        if (!turnDone) {
-            // We've played everything requested but Mantella isn't done — wait
-            // briefly for the next line to finish generating (covers first-line
-            // TTS latency without a fixed timeout cascade).
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
-        // Turn is done AND queue fully played -> handle the stop.
-        if (pendingStop == "end") {
-            REX::INFO("Mantella: Conversation ended by Mantella");
-            g_conversationActive = false;
-            g_mantellaSpeaking.store(false);
-            return;
+        if (ReadQueueTurnDone()) {
+            REX::INFO("UNITY: NPC turn_done reached and queue drained; returning to input state");
+            awaitingPlayerInput = true;
+            awaitPromptWritten = false;
+            continue;
         }
 
-        // player_talk: await player input, then start a fresh turn (reset queue).
-        REX::INFO("Mantella: Awaiting player input");
-        g_mantellaSpeaking.store(false);
-        WriteAwaitInput(lastNonce);
-        bool gotInput = false;
-        while (g_conversationActive && !gotInput) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            std::string currentNonce = ReadIniValue("request", "nonce", "");
-            std::string currentType = ReadIniValue("request", "type", "");
-            std::transform(currentType.begin(), currentType.end(), currentType.begin(), ::tolower);
-            if (currentNonce == lastNonce) continue;
-            lastNonce = currentNonce;
-            if (currentType == "end") {
-                REX::INFO("Mantella: Player ended conversation");
-                g_conversationActive = false;
-                g_mantellaSpeaking.store(false);
-                SendToMantella(BuildEndJson());
-                return;
-            }
-            else if (currentType == "player_input") {
-                std::string playerInput = ReadIniValue("request", "player_input", "");
-                REX::INFO("Mantella: Player said: {}", playerInput);
-                // Reset the queue file BEFORE telling Mantella the player spoke,
-                // so the new turn's first line lands in line_0. C++ owns this
-                // reset (it's the authoritative turn boundary); Python only ever
-                // appends from the current write_index. Truncating the file clears
-                // both write_index and all old [line_*] sections at once.
-                {
-                    std::ofstream qf(QUEUE_INI, std::ios::trunc);
-                    qf << "[queue]\nwrite_index=0\nread_index=0\n";
-                }
-                SendToMantella(BuildPlayerInputJson(playerInput));
-                localRead = 0;
-                turnDone = false;
-                pendingStop.clear();
-                gotInput = true;
-            }
-        }
+        // No line ready yet, and stream not done. Wait briefly for Python.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -557,29 +578,17 @@ void BridgeMonitorThread()
 
         if (type == "start" && !g_conversationActive) {
             g_conversationActive = true;
-            std::string startResponse = SendToMantella(BuildStartJson(speaker));
-            std::string startReplyType = GetReplyType(startResponse);
-            REX::INFO("Mantella: Start reply type: {}", startReplyType);
-            int retries = 0;
-            while (startReplyType != "mantella_start_conversation_completed" && retries < 20) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                startResponse = SendToMantella(BuildContinueJson());
-                startReplyType = GetReplyType(startResponse);
-                REX::INFO("Mantella: Waiting for start completed, reply: {}", startReplyType);
-                retries++;
-            }
-            if (startReplyType == "mantella_start_conversation_completed") {
-                REX::INFO("Mantella: Conversation started successfully");
-                std::thread(RunConversationLoop, nonce).detach();
-            } else {
-                REX::ERROR("Mantella: Failed to start conversation after {} retries", retries);
-                g_conversationActive = false;
-            }
+            REX::INFO("UNITY: Conversation start, speaker={}", speaker);
+            // No Mantella start handshake in UNITY. Spawn the play-and-await loop
+            // first (so it's ready to drain whatever the greeting stream enqueues),
+            // then fire an initial stream to get the NPC's greeting. A greeting is
+            // just an inputtext turn with no real player line; the server generates
+            // an opener from the NPC profile/context.
+            std::thread(RunConversationLoop, nonce).detach();
         }
         else if (type == "end") {
             g_conversationActive = false;
             g_mantellaSpeaking.store(false);
-            SendToMantella(BuildEndJson());
         }
     }
 }
@@ -646,5 +655,6 @@ SFSE_PLUGIN_LOAD(const SFSE::LoadInterface* a_sfse)
     REX::INFO("Mantella Starfield bridge plugin loaded");
     InstallVoiceHook();
     std::thread(BridgeMonitorThread).detach();
+
     return true;
 }
