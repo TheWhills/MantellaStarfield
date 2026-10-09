@@ -28,7 +28,7 @@ REGISTERED_MALE_FOLDER = "NPCMBarrett"
 MALE_VOICE_TYPES = {
     "NPCMBarrett", "NPCMWalterStroud", "NPCMSamCoe", "NPCMVladimirSall",
     "NPCMMatteoKhatri", "NPCMHeller", "GenericMaleEvenToned",
-    "NPCMGrandInquisitor", "NPCMLukeSkywalker",
+    "NPCMGrandInquisitor", "NPCMLukeSkywalker", "NPCMStarkiller",
 }
 
 MO2_VOICE_BASE = r"E:\Star Wars Genesis\Game\mods\MantellaStarfield\Sound\Voice\MantellaStarfield.esp"
@@ -48,6 +48,23 @@ _slot_idx = 0
 
 def log(msg):
     print(f"[unity-wemgen] {msg}", flush=True)
+
+
+def _filter_ffxc_noise(text):
+    """Strips FaceFX's own bone-pose/unused-track warnings from ffxc's
+    stdout/stderr before logging it. These two warning types alone can
+    produce 100+ lines on essentially every single compile - the shared
+    rig has far more bones/tracks than any one short animation actually
+    uses - and they've never once indicated a real problem, just drowned
+    out anything that would (genuine errors, the build summary). Keeps
+    every other line untouched."""
+    if not text:
+        return text
+    kept = [
+        line for line in text.splitlines()
+        if "[-Wempty-bone-pose]" not in line and "[-Wunused-track]" not in line
+    ]
+    return "\n".join(kept)
 
 
 def next_slot():
@@ -360,9 +377,11 @@ def build_lipsync(wav_path, slot, voice_folder, subtitle):
         return None
 
     ffxc_out = (r.stdout.decode(errors="replace").strip() if r.stdout else "")
+    ffxc_out = _filter_ffxc_noise(ffxc_out)
     if ffxc_out:
         log(f"  ffxc stdout ({slot}): {ffxc_out}")
     ffxc_err = (r.stderr.decode(errors="replace").strip() if r.stderr else "")
+    ffxc_err = _filter_ffxc_noise(ffxc_err)
     if ffxc_err:
         log(f"  ffxc stderr ({slot}): {ffxc_err}")
 
@@ -486,7 +505,7 @@ def write_turn_done():
     log("  marked queue turn_done=1")
 
 
-def write_queue_line(idx, wem_dest, subtitle, duration):
+def write_queue_line(idx, wem_dest, subtitle, duration, speaker_name=""):
     import ctypes
     W = ctypes.windll.kernel32.WritePrivateProfileStringA
     q = QUEUE_INI.encode()
@@ -495,6 +514,12 @@ def write_queue_line(idx, wem_dest, subtitle, duration):
     W(sec, b"wem_path", wem_dest.encode(), q)
     W(sec, b"subtitle", subtitle.encode("utf-8", "replace"), q)
     W(sec, b"duration", f"{duration:.2f}".encode(), q)
+    # Name of the NPC who speaks this line, threaded straight through from
+    # UnityChat.cpp's work-file line (no resolution needed - it's already
+    # the server's own actor name) -> here -> the queue -> Papyrus, so the
+    # scene alias can retarget per-line via GetFormsByTESFullName instead
+    # of staying fixed to whoever started the conversation.
+    W(sec, b"speaker_name", str(speaker_name).encode(), q)
     W(b"queue", b"write_index", str(idx + 1).encode(), q)
 
 
@@ -516,7 +541,7 @@ def is_bad_subtitle(subtitle):
     return False
 
 
-def process_line(hostport, hash_, voice_folder, subtitle):
+def process_line(hostport, hash_, voice_folder, subtitle, speaker_name=""):
     subtitle = subtitle.strip()
 
     if is_bad_subtitle(subtitle):
@@ -538,7 +563,9 @@ def process_line(hostport, hash_, voice_folder, subtitle):
 
     # LipGenerator's own usage banner confirms it wants the raw WAV
     # ("wav - Specifies the WAV file to analyze"), not the Wwise-encoded
-    # wem. It also wants the spoken text as a FILE PATH (see build_lipsync).
+    # wem. Text is passed as a raw string (matching Mantella's own
+    # starfield.py exactly) - NOT a file path; an earlier attempt to write
+    # it to a .txt file and pass that path instead was reverted.
     ffxanim_src = build_lipsync(wav, slot, voice_folder, subtitle)
     if ffxanim_src:
         deploy_ffxanim(ffxanim_src, voice_folder, slot)
@@ -548,8 +575,8 @@ def process_line(hostport, hash_, voice_folder, subtitle):
     duration = estimate_duration(wav)
     idx = read_write_index()
 
-    write_queue_line(idx, dest, subtitle, duration)
-    log(f"  queued line {idx}: slot={slot} dur={duration}s '{subtitle[:60]}'")
+    write_queue_line(idx, dest, subtitle, duration, speaker_name)
+    log(f"  queued line {idx}: slot={slot} dur={duration}s speaker_name={speaker_name} '{subtitle[:60]}'")
     return True
 
 
@@ -598,21 +625,22 @@ def main():
                         consumed += 1
                         continue
 
-                    parts = raw.split("|", 2)
-                    if len(parts) < 3:
+                    parts = raw.split("|", 3)
+                    if len(parts) < 4:
                         log(f"  skip malformed work line: {raw!r}")
                         consumed += 1
                         continue
 
-                    hash_, voice_folder, subtitle = parts
+                    hash_, voice_folder, speaker_name, subtitle = parts
 
-                    log(f"processing {hash_.strip()} voice={voice_folder.strip()}")
+                    log(f"processing {hash_.strip()} voice={voice_folder.strip()} speaker_name={speaker_name.strip()}")
 
                     process_line(
                         hostport,
                         hash_.strip(),
                         voice_folder.strip(),
                         subtitle,
+                        speaker_name.strip(),
                     )
 
                     consumed += 1

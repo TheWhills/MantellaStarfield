@@ -476,6 +476,108 @@ std::string GetUnityServerHomeUrl() {
   return "http://" + host + ":" + IntToStr((long long)g_unityPort) + "/UNITYServer/";
 }
 
+// --- Speech-to-text upload ---------------------------------------------
+std::string PostAudioForTranscription(const std::string& wavBytes) {
+  EnsureDiscovered();
+
+  if (wavBytes.empty()) {
+    UErr("PostAudioForTranscription: empty WAV data, refusing to upload.");
+    return "";
+  }
+
+  // Manual multipart/form-data body, matching stt.php's $_FILES['file']
+  // expectation (single field, filename/content-type set so PHP's file
+  // upload handling recognizes it correctly).
+  std::string boundary = "----UnityVoiceBoundary" + IntToStr((long long)GetTickCount());
+  std::string body;
+  body += "--" + boundary + "\r\n";
+  body += "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n";
+  body += "Content-Type: audio/wav\r\n";
+  body += "Content-Transfer-Encoding: binary\r\n\r\n";
+  body += wavBytes;
+  body += "\r\n--" + boundary + "--\r\n";
+
+  HINTERNET hSession = WinHttpOpen(L"Unity/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!hSession) {
+    UErr("PostAudioForTranscription: Failed to create WinHTTP session.");
+    return "";
+  }
+  // STT round-trip (upload + OpenAI transcription) can take a while -
+  // matching the 60s timeout the reference PHP implementation itself
+  // uses for the OpenAI call.
+  WinHttpSetTimeouts(hSession, 60000, 60000, 60000, 60000);
+
+  HINTERNET hConnect = WinHttpConnect(hSession, g_unityHost.c_str(), g_unityPort, 0);
+  if (!hConnect) {
+    UErr("PostAudioForTranscription: Failed to connect to resolved UNITY server.");
+    WinHttpCloseHandle(hSession);
+    return "";
+  }
+
+  HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/UNITYServer/stt.php",
+                                          NULL, WINHTTP_NO_REFERER,
+                                          WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+  if (!hRequest) {
+    UErr("PostAudioForTranscription: Failed to create HTTP request handle.");
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return "";
+  }
+
+  std::wstring header = L"Content-Type: multipart/form-data; boundary=" + ToWide(boundary) + L"\r\n";
+  BOOL sendOk = WinHttpSendRequest(hRequest, header.c_str(), (DWORD)-1L,
+                                   (LPVOID)body.data(), (DWORD)body.size(),
+                                   (DWORD)body.size(), 0);
+
+  std::string responseText;
+  bool success = false;
+  if (sendOk && WinHttpReceiveResponse(hRequest, NULL)) {
+    responseText = ReadHttpResponse(hRequest);
+    success = true;
+  }
+
+  if (!success) {
+    UErr("PostAudioForTranscription: HTTP request failed with error " +
+         IntToStr((long long)GetLastError()));
+  }
+
+  WinHttpCloseHandle(hRequest);
+  WinHttpCloseHandle(hConnect);
+  WinHttpCloseHandle(hSession);
+
+  if (!success) {
+    return "";
+  }
+
+  // Response body IS the transcription (plain text, per stt.php's
+  // contract) - no parsing needed, just trim whitespace/newlines. BOTH
+  // ends, not just trailing - confirmed via a real in-game test that
+  // OpenAI's response can carry a LEADING newline (logged transcription
+  // was literally "'\nCan you hear me?'"). That leading newline, left
+  // untrimmed, corrupts the Bridge.ini [voice] "text" entry once written
+  // via WritePrivateProfileStringA: the classic Win32 INI-writing API
+  // doesn't handle an embedded newline inside a value correctly, so the
+  // entry gets truncated/malformed on write, and Papyrus reads back
+  // something that fails its "voiceText != ''" check even when every
+  // other condition (ConversationActive/WaitingForInput/!IsAccumulating)
+  // is correctly true - exactly the symptom observed (diagnostic showed
+  // active=True waiting=True accumulating=False, yet nothing was sent).
+  size_t start = 0;
+  while (start < responseText.size() &&
+         (responseText[start] == '\n' || responseText[start] == '\r' ||
+          responseText[start] == ' ')) {
+    start++;
+  }
+  responseText.erase(0, start);
+  while (!responseText.empty() &&
+         (responseText.back() == '\n' || responseText.back() == '\r' ||
+          responseText.back() == ' ')) {
+    responseText.pop_back();
+  }
+  return responseText;
+}
+
 bool IsDwemerDistroConnected() {
   return InterlockedCompareExchange(&g_dwemerDistroConnected, 0, 0) != 0;
 }

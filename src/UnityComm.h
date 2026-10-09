@@ -66,6 +66,16 @@ void SendUnityEventAsync(const std::string& eventType,
                          long long gamets,
                          const std::string& eventData);
 
+// --- Speech-to-text upload ---------------------------------------------
+// POSTs raw WAV bytes as multipart/form-data (field name "file", matching
+// UNITYServer's stt.php contract) to /UNITYServer/stt.php. Returns the
+// transcribed text as a plain string, or empty on any failure - stt.php's
+// response body IS the transcription (or empty), not JSON, so there's no
+// parsing needed on this side. Separate from PostToUnityWithResponse
+// because that function hardcodes Content-Type: application/json for
+// every POST, which a multipart file upload can't use.
+std::string PostAudioForTranscription(const std::string& wavBytes);
+
 // --- Packet building (exposed for reuse) -----------------------------------
 std::wstring ToWide(const std::string& value);
 std::string  UrlEncode(const std::string& input);

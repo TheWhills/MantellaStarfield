@@ -1,18 +1,15 @@
 #pragma once
+#include <cstdint>
 #include <string>
 
 // -----------------------------------------------------------------------------
-// UnityChat - Stage 2 conversation transport for the UNITY Starfield plugin.
+// UnityChat - conversation transport for the UNITY Starfield plugin.
 //
 // Bridges the UnityComm streaming layer to the existing MantellaQueue.ini
 // playback queue. A single inputtext request to stream.php returns multiple
-// NPC lines (actor|action|subtitle|uid=...); each streamed line is written as
-// the next [line_N] section so the existing PlayQueuedLine loop drains it.
-//
-// STAGE 2 IS SUBTITLE-ONLY: TTS is not configured yet, so streamed lines carry
-// no tts= hash and no wem_path. PlayQueuedLine's new empty-wem branch shows the
-// subtitle for a computed duration and skips audio/lips. When TTS is wired
-// later, the parser fills wem_path and the audio path re-engages unchanged.
+// NPC lines (actor|action|subtitle|uid=...|tts=...); each streamed line is
+// written as the next [line_N] section so the existing PlayQueuedLine loop
+// drains it.
 // -----------------------------------------------------------------------------
 
 // Fire a conversation turn: reset the queue, stream inputtext to the server, and
@@ -23,6 +20,37 @@ void SendUnityConversation(const std::string& npcProfile,
                            const std::string& playerText,
                            long long gamets);
 
+// Fire a bored event for npcProfile: same transport as SendUnityConversation
+// but eventType="bored" and no player text. Called from main.cpp's
+// MaybeTriggerBoredEvent once it has picked an eligible NPC via
+// GetLeastBoredNearbyNpc. Non-blocking: spawns a detached thread.
+void SendUnityBoredEvent(const std::string& npcProfile, long long gamets);
+
 // Estimate a subtitle display duration (seconds) from text length, used when a
 // line has no TTS audio to derive real duration from. Exposed for reuse/tuning.
 float EstimateSubtitleDurationSeconds(const std::string& subtitle);
+
+// Defined in main.cpp, where g_activatedNpcs lives. Serializes the activated-
+// NPC roster into the ?people= JSON array SendUnityConversation attaches to
+// its request, per the reverse-engineered extractParticipantIdentityToken()
+// contract (see main.cpp for format notes / open StorageID question).
+std::string BuildActivatedRosterPeopleParam();
+
+// Defined in main.cpp, where g_activatedNpcs lives. Resolves a streamed
+// line's actor name to a FormID via roster lookup, falling back to
+// g_currentSpeakerFormID if no roster match - correct-by-construction for
+// ordinary single-NPC turns. NOTE: this function already existed with a
+// comment claiming it was "declared in UnityChat.h", but that declaration
+// was never actually added - this is that fix.
+std::uint32_t ResolveActorFormIdByName(const std::string& name);
+
+// Defined in main.cpp, where g_activatedNpcs lives. Unlike
+// ResolveActorFormIdByName, this does NOT fall back to
+// g_currentSpeakerFormID - callers need a genuine "no match" signal (empty
+// string), not a best-effort guess. Returns the roster's own stored name
+// (exact casing) if candidateName case-insensitively matches an activated
+// NPC OTHER than excludeName, or "" otherwise. Used to detect who a line
+// is actually addressing by parsing its opening "<Name>, " against the
+// roster, rather than trusting a hardcoded default.
+std::string FindActivatedNpcNameExcluding(const std::string& candidateName,
+                                          const std::string& excludeName);
