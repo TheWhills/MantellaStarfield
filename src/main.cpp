@@ -1260,6 +1260,8 @@ void PlayQueuedLine(int idx)
     // CassiopeiaPapyrusExtender, so Papyrus resolves by name directly via
     // GetFormsByTESFullName instead.
     std::string speakerName = ReadQueueValue(sec.c_str(), "speaker_name", "");
+    // Server-side id of this line (uid=utt_... from the stream).
+    std::string utteranceId = ReadQueueValue(sec.c_str(), "utterance_id", "");
 
     float duration = 2.0f;
     try {
@@ -1293,6 +1295,18 @@ void PlayQueuedLine(int idx)
     REX::INFO("Mantella: Playing line {} (duration={}s) speaker_name={}", idx, duration, speakerName);
 
     WriteSpeakingState(duration);
+
+    // Tell the server this line was actually delivered. UNITYServer stores
+    // every NPC line as delivery_state='pending' and only lets 'spoken' lines
+    // into ANY NPC's prompt history and long-term memory (DataEventLog's
+    // delivery-visibility filter). CHIM/STOBE acknowledge each line through
+    // speech_delivery.php; without this, no NPC ever remembered anything an
+    // NPC said - including what it said itself. Fire-and-forget, so playback
+    // never waits on the network.
+    if (!utteranceId.empty()) {
+        AsyncPostToUnity(L"/UNITYServer/speech_delivery.php",
+            "{\"utterance_id\":\"" + EscapeJson(utteranceId) + "\",\"delivery_state\":\"spoken\"}");
+    }
     // Written per-line, separately from WriteSpeakingState, so Papyrus can
     // retarget MantellaSpeakerAlias to THIS line's actual speaker before
     // starting the scene, instead of staying fixed to whoever the G-key

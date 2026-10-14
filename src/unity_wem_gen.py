@@ -85,6 +85,9 @@ FALLBACK_HOSTPORT = _get("ServerHostPort", "127.0.0.1:8087")
 
 MAX_LINE_ATTEMPTS = 3
 
+# Server utterance ids look like utt_<hex>; empty when the server sent none.
+UTTERANCE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]*")
+
 WEM_SLOTS = [f"{i:08X}" for i in range(0x00666A79, 0x00666A79 + 200)]
 
 _slot_idx = 0
@@ -633,7 +636,7 @@ def write_turn_done():
     log("  marked queue turn_done=1")
 
 
-def write_queue_line(idx, wem_dest, subtitle, duration, speaker_name=""):
+def write_queue_line(idx, wem_dest, subtitle, duration, speaker_name="", utterance_id=""):
     import ctypes
     W = ctypes.windll.kernel32.WritePrivateProfileStringA
     q = QUEUE_INI.encode()
@@ -648,6 +651,9 @@ def write_queue_line(idx, wem_dest, subtitle, duration, speaker_name=""):
     # scene alias can retarget per-line via GetFormsByTESFullName instead
     # of staying fixed to whoever started the conversation.
     W(sec, b"speaker_name", str(speaker_name).encode(), q)
+    # The plugin reports this id back to the server as "spoken" when the
+    # line plays, which is what lets NPCs remember it (speech_delivery.php).
+    W(sec, b"utterance_id", str(utterance_id).encode(), q)
     W(b"queue", b"write_index", str(idx + 1).encode(), q)
 
 
@@ -669,7 +675,7 @@ def is_bad_subtitle(subtitle):
     return False
 
 
-def process_line(hostport, hash_, voice_folder, subtitle, speaker_name=""):
+def process_line(hostport, hash_, voice_folder, subtitle, speaker_name="", utterance_id=""):
     subtitle = subtitle.strip()
 
     if is_bad_subtitle(subtitle):
@@ -703,7 +709,7 @@ def process_line(hostport, hash_, voice_folder, subtitle, speaker_name=""):
     duration = estimate_duration(wav)
     idx = read_write_index()
 
-    write_queue_line(idx, dest, subtitle, duration, speaker_name)
+    write_queue_line(idx, dest, subtitle, duration, speaker_name, utterance_id)
     log(f"  queued line {idx}: slot={slot} dur={duration}s speaker_name={speaker_name} '{subtitle[:60]}'")
     return True
 
@@ -773,13 +779,19 @@ def main():
                         consumed += 1
                         continue
 
-                    parts = raw.split("|", 3)
-                    if len(parts) < 4:
-                        log(f"  skip malformed work line: {raw!r}")
-                        consumed += 1
-                        continue
-
-                    hash_, voice_folder, speaker_name, subtitle = parts
+                    # hash|voice_folder|speaker_name|utterance_id|subtitle
+                    # (older plugins wrote hash|voice_folder|speaker_name|subtitle)
+                    parts5 = raw.split("|", 4)
+                    if len(parts5) == 5 and UTTERANCE_ID_RE.fullmatch(parts5[3].strip()):
+                        hash_, voice_folder, speaker_name, utterance_id, subtitle = parts5
+                    else:
+                        parts = raw.split("|", 3)
+                        if len(parts) < 4:
+                            log(f"  skip malformed work line: {raw!r}")
+                            consumed += 1
+                            continue
+                        hash_, voice_folder, speaker_name, subtitle = parts
+                        utterance_id = ""
 
                     log(f"processing {hash_.strip()} voice={voice_folder.strip()} speaker_name={speaker_name.strip()}")
 
@@ -790,6 +802,7 @@ def main():
                             voice_folder.strip(),
                             subtitle,
                             speaker_name.strip(),
+                            utterance_id.strip(),
                         )
                     except Exception as e:
                         # One bad line must never wedge the watcher. Before,

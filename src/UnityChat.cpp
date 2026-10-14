@@ -182,7 +182,7 @@ void ResetWorkFile() {
 }
 
 // Append one pending line for the Python generator:
-// hash|voice_folder|speaker_name|subtitle
+// hash|voice_folder|speaker_name|utterance_id|subtitle
 //
 // speaker_name is just pl.actor - no resolution needed on the C++ side at
 // all, since Papyrus resolves by name directly via
@@ -211,8 +211,12 @@ void AppendWorkLine(const ParsedLine& pl) {
   // here, same reasoning as the subtitle newline stripping above.
   std::string safeSpeakerName = pl.actor;
   std::replace(safeSpeakerName.begin(), safeSpeakerName.end(), '|', ' ');
-  fprintf(f, "%s|%s|%s|%s\n", pl.ttsHash.c_str(), voiceFolder.c_str(),
-          safeSpeakerName.c_str(), safeSub.c_str());
+  // utterance id (uid=utt_...) rides along so the plugin can tell the
+  // server "spoken" when this line actually plays - see PlayQueuedLine.
+  std::string safeUid = pl.uid;
+  std::replace(safeUid.begin(), safeUid.end(), '|', ' ');
+  fprintf(f, "%s|%s|%s|%s|%s\n", pl.ttsHash.c_str(), voiceFolder.c_str(),
+          safeSpeakerName.c_str(), safeUid.c_str(), safeSub.c_str());
   fclose(f);
 }
 
