@@ -345,6 +345,90 @@ std::string FindActivatedNpcNameExcluding(const std::string& candidateName,
     return "";
 }
 
+// Picks which activated NPC should answer a player message, so the player
+// isn't locked to whoever the conversation started with:
+//   1. an activated NPC the message ADDRESSES by name (full or first name,
+//      case-insensitive): at the start ("Noel, ...", "hey Noel ...") or at
+//      the end after a comma ("..., Noel?"). Merely mentioning someone
+//      ("Is that Noel's data?") does not redirect the message,
+//   2. otherwise the activated NPC under the crosshair when it was sent,
+//   3. otherwise the current conversation partner.
+// Done here rather than in Papyrus because Cassiopeia's FindStr is
+// case-sensitive ("noel" would never match "Noel").
+std::string ResolveInputTargetName(const std::string& text, std::uint32_t crosshairFormId,
+                                   const std::string& currentSpeaker)
+{
+    auto lower = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v;
+    };
+    auto isWordChar = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '\'';
+    };
+    // Position of `needle` in `hay` as a whole word/phrase, or npos.
+    auto findWord = [&](const std::string& hay, const std::string& needle) -> size_t {
+        if (needle.empty()) return std::string::npos;
+        for (size_t pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1)) {
+            bool startOk = pos == 0 || !isWordChar(hay[pos - 1]);
+            size_t end = pos + needle.size();
+            bool endOk = end >= hay.size() || !isWordChar(hay[end]) ||
+                         (hay[end] == '\'' && end + 1 < hay.size() && hay[end + 1] == 's');  // "Noel's"
+            if (startOk && endOk) return pos;
+        }
+        return std::string::npos;
+    };
+
+    // Trim to the words that can carry a vocative: the start of the message
+    // (after a leading greeting/filler word) and the tail after the last comma.
+    std::string msg = lower(text);
+    while (!msg.empty() && !isWordChar(msg.back())) msg.pop_back();   // trailing ?!.
+    size_t lead = msg.find_first_not_of(" \t");
+    msg = (lead == std::string::npos) ? "" : msg.substr(lead);
+    static const char* kFillers[] = { "hey", "hi", "hello", "yo", "ok", "okay", "so", "well", "and", "but", "oh" };
+    std::string head = msg;
+    for (const char* f : kFillers) {
+        const std::string w = std::string(f) + " ";
+        const std::string wc = std::string(f) + ", ";
+        if (head.rfind(wc, 0) == 0) { head = head.substr(wc.size()); break; }
+        if (head.rfind(w, 0) == 0) { head = head.substr(w.size()); break; }
+    }
+    const size_t lastComma = msg.rfind(',');
+    std::string tail = (lastComma == std::string::npos) ? "" : msg.substr(lastComma + 1);
+    size_t tl = tail.find_first_not_of(" \t");
+    tail = (tl == std::string::npos) ? "" : tail.substr(tl);
+
+    // Name must START `head`, or BE the whole of `tail`.
+    auto addressedAs = [&](const std::string& name) -> int {   // 0 = no, 1 = start, 2 = end
+        if (name.empty()) return 0;
+        if (findWord(head, name) == 0 &&
+            !(head.size() > name.size() && head[name.size()] == '\'')) return 1;   // not "Noel's ..."
+        if (!tail.empty() && tail == name) return 2;
+        return 0;
+    };
+
+    std::string bestName;
+    int bestRank = 0;
+    std::string crosshairName;
+    {
+        std::lock_guard<std::mutex> lock(g_activatedNpcsMutex);
+        for (const auto& npc : g_activatedNpcs) {
+            const std::string full = lower(npc.name);
+            const std::string first = full.substr(0, full.find(' '));
+            int rank = addressedAs(full);
+            if (rank == 0 && first.size() >= 3) rank = addressedAs(first);
+            if (rank != 0 && (bestRank == 0 || rank < bestRank)) {   // start beats end
+                bestRank = rank;
+                bestName = npc.name;
+            }
+            if (crosshairFormId != 0 && npc.formId == crosshairFormId) crosshairName = npc.name;
+        }
+    }
+    if (!bestName.empty()) return bestName;
+    if (!crosshairName.empty()) return crosshairName;
+    return currentSpeaker;
+}
+
 // Forward declarations - defined later in this file, needed here since
 // the bored-event functions below (PlayBoredEventQueue, MaybeTriggerBoredEvent)
 // are inserted right after the roster helpers, ahead of their definitions.
@@ -1426,6 +1510,18 @@ void RunConversationLoop(const std::string& startNonce, std::uint64_t myGenerati
                 std::string playerInput = ReadIniValue("request", "player_input", "");
                 std::string speaker = ReadIniValue("request", "speaker", "Unknown");
                 REX::INFO("UNITY: Player said: {}", playerInput);
+
+                // Per-message responder (named NPC > crosshair NPC > current).
+                std::uint32_t crosshairFormId = 0;
+                try {
+                    crosshairFormId = static_cast<std::uint32_t>(
+                        std::stoll(ReadIniValue("request", "crosshair_refid", "0")));
+                } catch (...) {}
+                const std::string target = ResolveInputTargetName(playerInput, crosshairFormId, speaker);
+                if (target != speaker) {
+                    REX::INFO("UNITY: message addressed to '{}' instead of '{}'", target, speaker);
+                    speaker = target;
+                }
 
                 ResetQueueForNewTurn();
                 localRead = 0;
