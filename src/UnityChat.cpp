@@ -33,6 +33,7 @@
 #include <RE/Starfield.h>   // REX::INFO / REX::ERROR
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -42,8 +43,14 @@
 
 // Work file the Python generator watches. Plugin APPENDS pending TTS lines here;
 // Python consumes them, builds wems, and writes the playback queue below.
-static const char* UNITY_WORK_INI =
-    "E:\\Star Wars Genesis\\Game\\overwrite\\SFSE\\MantellaStarfield\\UnityWork.ini";
+// Built from GetBridgeDir() (resolved once in main.cpp's LoadPathConfig) so
+// this lands in the same folder as Bridge.ini/MantellaQueue.ini rather than
+// carrying its own separately-hardcoded copy of the path that could drift
+// out of sync with the other two.
+static std::string UnityWorkIniPath()
+{
+    return GetBridgeDir() + "UnityWork.ini";
+}
 
 // Per-NPC voice folder mapping. Mirrors Starfield.py's NPC_VOICE_TYPE_MAP so
 // the two sides of the pipeline agree on which folder each named NPC's
@@ -56,6 +63,16 @@ static const char* UNITY_WORK_INI =
 // StarfieldHumanFemale.facefx as a result. Confirmed fixed and working
 // in-game.
 namespace {
+
+// Chain epoch. Every chain (a player turn, a bored event, and all rechat hops
+// that follow from either) carries the epoch that was current when it began.
+// CancelPendingChats() bumps it, so any chain from before that point stops
+// queuing lines and stops firing follow-up hops. Without this, a rechat chain
+// kept running after Esc, or after the player sent a new line - appending the
+// OLD chain's lines (and its __ENDTURN__ marker) into the NEW turn's work file.
+std::atomic<std::uint64_t> g_chatEpoch{ 1 };
+
+bool IsEpochCurrent(std::uint64_t epoch) { return epoch == g_chatEpoch.load(); }
 
 const std::map<std::string, std::string>& NpcVoiceTypeMap() {
     static const std::map<std::string, std::string> m = {
@@ -76,7 +93,7 @@ const std::map<std::string, std::string>& NpcVoiceTypeMap() {
         {"Muria Siarkiewicz","NPCFMuria"},
         {"Luke Skywalker",   "NPCMLukeSkywalker"},
         {"Shanni Adasca",    "NPCFAndreja"},
-        {"Galen Marek", "NPCMStarkiller"},
+        {"Starkiller",       "NPCMGalenMarek"}, // Galen Marek - key must match speaker_name exactly (confirmed "Starkiller" from the actual server response, not "Galen Marek"). Value is a UNIQUE dedicated folder, same pattern as Grand Inquisitor's own entry - deliberately NOT "GenericMaleRough" itself, even though that's his real in-game voice type, since that folder is already written to unconditionally by ActivateLipsForCurrentLine's blanket generic-folder deployment for every line regardless of speaker - using it as his dedicated audio-routing slot too would collide with that. His real voice type (GenericMaleRough) doesn't need to appear in this map at all - the blanket ffxanim deployment already covers it separately, for lipsync specifically, same as it does for Grand Inquisitor.
     };
     return m;
 }
@@ -155,7 +172,8 @@ bool ParseServerLine(const std::string& raw, ParsedLine& out) {
 // sees this conversation's lines.
 void ResetWorkFile() {
   FILE* f = nullptr;
-  fopen_s(&f, UNITY_WORK_INI, "w");
+  std::string workIniPath = UnityWorkIniPath();
+  fopen_s(&f, workIniPath.c_str(), "w");
   if (f) {
     fclose(f);
   } else {
@@ -177,7 +195,8 @@ void ResetWorkFile() {
 // after subtitle instead would have broken that tolerance.
 void AppendWorkLine(const ParsedLine& pl) {
   FILE* f = nullptr;
-  fopen_s(&f, UNITY_WORK_INI, "a");
+  std::string workIniPath = UnityWorkIniPath();
+  fopen_s(&f, workIniPath.c_str(), "a");
   if (!f) {
     REX::ERROR("UnityChat: could not open work file for append");
     return;
@@ -201,7 +220,8 @@ void AppendWorkLine(const ParsedLine& pl) {
 // Python converts this into [queue] turn_done=1 after all prior lines are queued.
 void AppendEndTurnMarker() {
   FILE* f = nullptr;
-  fopen_s(&f, UNITY_WORK_INI, "a");
+  std::string workIniPath = UnityWorkIniPath();
+  fopen_s(&f, workIniPath.c_str(), "a");
   if (!f) {
     REX::ERROR("UnityChat: could not open work file for end-turn append");
     return;
@@ -228,6 +248,7 @@ void AppendEndTurnMarker() {
 // was completely invisible to the addressee-detection heuristic, which
 // only ever checked lastSubtitle.
 struct StreamLineTracker {
+  std::uint64_t epoch = 0;   // chain this stream belongs to (see g_chatEpoch)
   int lineCount = 0;
   std::string lastSpeaker;
   std::string lastSubtitle;
@@ -238,6 +259,10 @@ struct StreamLineTracker {
 // Called by PostToUnityWithResponseStream for each streamed line. Return true
 // to keep consuming.
 bool OnUnityStreamLine(const std::string& line, void* userData) {
+  if (userData && !IsEpochCurrent(static_cast<StreamLineTracker*>(userData)->epoch)) {
+    REX::INFO("UnityChat: chain superseded mid-stream, dropping remaining lines");
+    return false;  // stop reading this stream
+  }
   ParsedLine pl;
   if (!ParseServerLine(line, pl)) {
     return true;  // skip non-line output, keep streaming
@@ -290,6 +315,8 @@ struct ConvTask {
   //
   // eventType: which processor this task's own request routes to.
   std::string eventType = "inputtext"; // "inputtext" | "bored" | "rechat"
+  // Chain epoch this task belongs to - see g_chatEpoch.
+  std::uint64_t epoch = 0;
   // addressee: who THIS task's speaker is addressing. Empty by default -
   // was "Player" (matching STOBE's own unconditional default), but
   // confirmed via a full trace through rechat.php's candidate-selection
@@ -337,6 +364,16 @@ static constexpr int kMaxRechatDepth = 10;
 
 DWORD WINAPI RechatThread(LPVOID param);
 
+// Called at the end of every stream. The __ENDTURN__ marker (which Python
+// turns into [queue] turn_done=1) is written ONLY when the whole chain is
+// finished - i.e. when no rechat hop follows. Previously every hop wrote its
+// own marker; turn_done then went to 1 after the FIRST hop and stayed 1
+// (Python never clears it), so if playback caught up with generation during
+// the gap before the next hop's lines arrived, the conversation loop decided
+// the turn was over and the rest of the chain was silently never played.
+// A superseded chain writes no marker - whatever replaced it writes its own.
+void FinishStream(const ConvTask& task, const StreamLineTracker& tracker);
+
 // Fires a rechat follow-up if the turn that just completed actually
 // produced real spoken lines. Called unconditionally at the end of
 // ConversationThread/BoredEventThread/RechatThread, right after their
@@ -364,15 +401,19 @@ DWORD WINAPI RechatThread(LPVOID param);
 // budget exhausted, no eligible responder, private mode, etc.), and that
 // comes back exactly the same way a hop that was never going to continue
 // does, so no separate "did the server say stop" parsing is needed.
-void MaybeFireRechatFollowup(const ConvTask& completedTask, const StreamLineTracker& tracker) {
+bool MaybeFireRechatFollowup(const ConvTask& completedTask, const StreamLineTracker& tracker) {
+  if (!IsEpochCurrent(completedTask.epoch)) {
+    REX::INFO("UnityChat: chain superseded, not firing rechat follow-up");
+    return false;
+  }
   if (tracker.lineCount == 0 || tracker.lastSpeaker.empty()) {
-    return;
+    return false;
   }
 
   int nextDepth = completedTask.rechatDepth + 1;
   if (nextDepth > kMaxRechatDepth) {
     REX::INFO("UnityChat: rechat chain depth cap ({}) reached, not continuing", kMaxRechatDepth);
-    return;
+    return false;
   }
 
   // Detect who the speaker is actually addressing. Checks TWO patterns,
@@ -451,6 +492,7 @@ void MaybeFireRechatFollowup(const ConvTask& completedTask, const StreamLineTrac
   t->addressee = tracker.lastSpeaker;      // for THIS new hop's own eventual follow-up, if any
   t->initiator = completedTask.initiator;  // threaded unchanged down the chain
   t->rechatDepth = nextDepth;
+  t->epoch = completedTask.epoch;          // same chain
   t->rechatEventData = tracker.lastSpeaker + ": " + tracker.lastSubtitle;
   if (!detectedAddressee.empty()) {
     t->rechatEventData += " (talking to: " + detectedAddressee + ")";
@@ -461,6 +503,17 @@ void MaybeFireRechatFollowup(const ConvTask& completedTask, const StreamLineTrac
             detectedAddressee != completedTask.addressee, nextDepth);
 
   CreateThread(NULL, 0, RechatThread, t, 0, NULL);
+  return true;
+}
+
+void FinishStream(const ConvTask& task, const StreamLineTracker& tracker) {
+  if (!IsEpochCurrent(task.epoch)) {
+    REX::INFO("UnityChat: chain superseded, no end-turn marker");
+    return;
+  }
+  if (!MaybeFireRechatFollowup(task, tracker)) {
+    AppendEndTurnMarker();  // chain complete
+  }
 }
 
 DWORD WINAPI ConversationThread(LPVOID param) {
@@ -490,6 +543,7 @@ DWORD WINAPI ConversationThread(LPVOID param) {
             t->profile, t->playerText, peopleParam);
 
   StreamLineTracker tracker;
+  tracker.epoch = t->epoch;
   bool ok = PostToUnityWithResponseStream(endpoint, "", OnUnityStreamLine, &tracker);
   if (!ok) {
     REX::ERROR("UnityChat: stream request failed");
@@ -497,10 +551,7 @@ DWORD WINAPI ConversationThread(LPVOID param) {
     REX::INFO("UnityChat: stream complete");
   }
 
-  // Signal the Python watcher that no more TTS lines are coming for this turn.
-  AppendEndTurnMarker();
-
-  MaybeFireRechatFollowup(*t, tracker);
+  FinishStream(*t, tracker);
 
   delete t;
   return 0;
@@ -538,6 +589,7 @@ DWORD WINAPI BoredEventThread(LPVOID param) {
             t->profile, peopleParam);
 
   StreamLineTracker tracker;
+  tracker.epoch = t->epoch;
   bool ok = PostToUnityWithResponseStream(endpoint, "", OnUnityStreamLine, &tracker);
   if (!ok) {
     REX::ERROR("UnityChat: bored event stream request failed");
@@ -545,9 +597,7 @@ DWORD WINAPI BoredEventThread(LPVOID param) {
     REX::INFO("UnityChat: bored event stream complete");
   }
 
-  AppendEndTurnMarker();
-
-  MaybeFireRechatFollowup(*t, tracker);
+  FinishStream(*t, tracker);
 
   delete t;
   return 0;
@@ -603,6 +653,7 @@ DWORD WINAPI RechatThread(LPVOID param) {
             t->rechatDepth, t->initiator, t->rechatEventData);
 
   StreamLineTracker tracker;
+  tracker.epoch = t->epoch;
   bool ok = PostToUnityWithResponseStream(endpoint, "", OnUnityStreamLine, &tracker);
   if (!ok) {
     REX::ERROR("UnityChat: rechat stream request failed");
@@ -610,15 +661,11 @@ DWORD WINAPI RechatThread(LPVOID param) {
     REX::INFO("UnityChat: rechat stream complete ({} lines)", tracker.lineCount);
   }
 
-  AppendEndTurnMarker();
-
   // Continue the chain if this hop produced real lines - mirrors STOBE's
   // "if (parseState.lineCount > 0) DispatchRechatFollowup(...)" exactly.
-  // Correctly self-terminates even when rechat.php itself decided to stop
-  // (depth budget reached, no eligible responder, private mode, etc.) -
-  // those cases come back with zero lines, which this same check already
-  // treats as "don't continue," no separate server-said-stop parsing needed.
-  MaybeFireRechatFollowup(*t, tracker);
+  // Self-terminates when rechat.php returns zero lines (depth budget
+  // reached, no eligible responder, private mode, etc.).
+  FinishStream(*t, tracker);
 
   delete t;
   return 0;
@@ -633,10 +680,17 @@ float EstimateSubtitleDurationSeconds(const std::string& subtitle) {
   return secs;
 }
 
+void CancelPendingChats() {
+  std::uint64_t e = g_chatEpoch.fetch_add(1) + 1;
+  REX::INFO("UnityChat: pending chats cancelled (epoch now {})", e);
+}
+
 void SendUnityConversation(const std::string& npcProfile,
                            const std::string& playerText,
                            long long gamets) {
+  CancelPendingChats();  // a new player turn supersedes any running chain
   ConvTask* t = new ConvTask();
+  t->epoch = g_chatEpoch.load();
   t->profile = npcProfile;
   t->playerText = playerText;
   t->gamets = (gamets > 0) ? gamets : 1;
@@ -651,7 +705,9 @@ void SendUnityConversation(const std::string& npcProfile,
 }
 
 void SendUnityBoredEvent(const std::string& npcProfile, long long gamets) {
+  CancelPendingChats();  // a new bored event supersedes any running chain
   ConvTask* t = new ConvTask();
+  t->epoch = g_chatEpoch.load();
   t->profile = npcProfile;
   t->playerText = "";
   t->gamets = (gamets > 0) ? gamets : 1;

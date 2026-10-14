@@ -26,6 +26,13 @@ void SendUnityConversation(const std::string& npcProfile,
 // GetLeastBoredNearbyNpc. Non-blocking: spawns a detached thread.
 void SendUnityBoredEvent(const std::string& npcProfile, long long gamets);
 
+// Invalidates every in-flight conversation/bored/rechat chain. Any stream
+// still running stops queuing lines, and no further rechat hops fire from
+// it. Called from main.cpp on conversation end / reinit. SendUnityConversation
+// and SendUnityBoredEvent also call it themselves, so a new player turn or
+// bored event always supersedes an older chain instead of interleaving with it.
+void CancelPendingChats();
+
 // Estimate a subtitle display duration (seconds) from text length, used when a
 // line has no TTS audio to derive real duration from. Exposed for reuse/tuning.
 float EstimateSubtitleDurationSeconds(const std::string& subtitle);
@@ -54,3 +61,10 @@ std::uint32_t ResolveActorFormIdByName(const std::string& name);
 // roster, rather than trusting a hardcoded default.
 std::string FindActivatedNpcNameExcluding(const std::string& candidateName,
                                           const std::string& excludeName);
+
+// Defined in main.cpp, where LoadPathConfig() resolves it once at plugin
+// load. Returns the resolved bridge directory (trailing backslash included)
+// so every file in this pipeline - Bridge.ini, MantellaQueue.ini,
+// UnityWork.ini - lands in the same user-configured or default location
+// instead of each having its own separately hardcoded copy of the path.
+std::string GetBridgeDir();

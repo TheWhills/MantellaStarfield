@@ -7,17 +7,48 @@ import urllib.request
 import subprocess
 from pathlib import Path
 
-WWISE_CONSOLE = r"C:\Audiokinetic\Wwise_2021.1.14.8108\Authoring\x64\Release\bin\WwiseConsole.exe"
-WWISE_PROJ = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\wwise\Starfield\Starfield.wproj"
+import configparser
+import json
+import re
+import sys
+import threading
 
-# Lipsync tools - same paths confirmed working in Mantella's starfield.py
-LIPGENERATOR_EXE = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\LipGenerator\LipGenerator.exe"
-FFXC_EXE = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\FaceFX\ffxc.exe"
-FACEFX_FEMALE = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\FaceFX\StarfieldHumanFemale.facefx"
-FACEFX_MALE = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\FaceFX\StarfieldHumanMale.facefx"
-FACEFX_ANALYSIS = r"E:\SteamLibrary\steamapps\common\Starfield\Tools\FaceFX\GenesisDefault.facefx"
-INTERMEDIATE_FEMALE = r"E:\SteamLibrary\steamapps\common\Starfield\Intermediate\Slice_01"
-INTERMEDIATE_MALE = r"E:\SteamLibrary\steamapps\common\Starfield\Intermediate\Slice_00"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# All machine-specific paths come from unity_wem_gen.ini (next to this script,
+# or pass a path as the first argument). Only StarfieldDir and BridgeDir are
+# normally needed; every Creation Kit tool path is derived from StarfieldDir.
+# See unity_wem_gen.example.ini for a commented template.
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(SCRIPT_DIR, "unity_wem_gen.ini")
+
+_cfg = configparser.ConfigParser(interpolation=None)
+_cfg.optionxform = str
+if os.path.exists(CONFIG_PATH):
+    _cfg.read(CONFIG_PATH, encoding="utf-8")
+
+
+def _get(key, default=""):
+    v = _cfg.get("Paths", key, fallback="").strip().strip('"')
+    return v if v else default
+
+
+STARFIELD_DIR = _get("StarfieldDir", r"C:\Program Files (x86)\Steam\steamapps\common\Starfield")
+_TOOLS = os.path.join(STARFIELD_DIR, "Tools")
+
+WWISE_CONSOLE = _get("WwiseConsole", r"C:\Audiokinetic\Wwise_2021.1.14.8108\Authoring\x64\Release\bin\WwiseConsole.exe")
+WWISE_PROJ = _get("WwiseProject", os.path.join(_TOOLS, "wwise", "Starfield", "Starfield.wproj"))
+
+# Lipsync tools - same layout confirmed working in Mantella's starfield.py
+LIPGENERATOR_EXE = _get("LipGenerator", os.path.join(_TOOLS, "LipGenerator", "LipGenerator.exe"))
+FFXC_EXE = _get("Ffxc", os.path.join(_TOOLS, "FaceFX", "ffxc.exe"))
+FACEFX_FEMALE = os.path.join(_TOOLS, "FaceFX", "StarfieldHumanFemale.facefx")
+FACEFX_MALE = os.path.join(_TOOLS, "FaceFX", "StarfieldHumanMale.facefx")
+FACEFX_ANALYSIS = os.path.join(_TOOLS, "FaceFX", "GenesisDefault.facefx")
+INTERMEDIATE_FEMALE = os.path.join(STARFIELD_DIR, "Intermediate", "Slice_01")
+INTERMEDIATE_MALE = os.path.join(STARFIELD_DIR, "Intermediate", "Slice_00")
 
 # Registered folders - must match what's in the ffxcproj animset (same
 # constraint as Mantella's starfield.py: LipGenerator/ffxc only recognize
@@ -28,18 +59,31 @@ REGISTERED_MALE_FOLDER = "NPCMBarrett"
 MALE_VOICE_TYPES = {
     "NPCMBarrett", "NPCMWalterStroud", "NPCMSamCoe", "NPCMVladimirSall",
     "NPCMMatteoKhatri", "NPCMHeller", "GenericMaleEvenToned",
-    "NPCMGrandInquisitor", "NPCMLukeSkywalker", "NPCMStarkiller",
+    "NPCMGrandInquisitor", "NPCMLukeSkywalker",
 }
 
-MO2_VOICE_BASE = r"E:\Star Wars Genesis\Game\mods\MantellaStarfield\Sound\Voice\MantellaStarfield.esp"
-DATA_VOICE_BASE = r"E:\SteamLibrary\steamapps\common\Starfield\Data\Sound\Voice\MantellaStarfield.esp"
+# The real Data voice folder. ffxc must compile into here (see CLAUDE.md §5).
+DATA_VOICE_BASE = os.path.join(STARFIELD_DIR, "Data", "Sound", "Voice", "MantellaStarfield.esp")
+# Optional second copy target - the MO2 mod folder, if the mod is installed
+# through MO2. Empty = only write to DATA_VOICE_BASE.
+MO2_VOICE_BASE = _get("MO2VoiceDir", "")
+VOICE_BASES = [b for b in (MO2_VOICE_BASE, DATA_VOICE_BASE) if b]
 
-QUEUE_INI = r"E:\Star Wars Genesis\Game\overwrite\SFSE\MantellaStarfield\MantellaQueue.ini"
-WORK_FILE = r"E:\Star Wars Genesis\Game\overwrite\SFSE\MantellaStarfield\UnityWork.ini"
-SCRATCH = r"C:\Temp\unity_wemgen"
+# Folder shared with the plugin + Papyrus. Must be the REAL on-disk folder:
+#   no MO2:   <StarfieldDir>\Data\SFSE\MantellaStarfield
+#   with MO2: <MO2 instance>\overwrite\SFSE\MantellaStarfield
+BRIDGE_DIR = _get("BridgeDir", os.path.join(STARFIELD_DIR, "Data", "SFSE", "MantellaStarfield"))
+QUEUE_INI = os.path.join(BRIDGE_DIR, "MantellaQueue.ini")
+WORK_FILE = os.path.join(BRIDGE_DIR, "UnityWork.ini")
+HEARTBEAT_INI = os.path.join(BRIDGE_DIR, "UnityWatcher.ini")
+SCRATCH = _get("ScratchDir", os.path.join(os.environ.get("TEMP", r"C:\Temp"), "unity_wemgen"))
 
 DISCOVERY_URL = "http://127.0.0.1:7135/discover?game=starfield"
-FALLBACK_HOSTPORT = "172.25.224.225:8087"
+# Used if the Dwemer launcher's discovery service doesn't answer. With WSL2's
+# default localhost forwarding, 127.0.0.1 reaches the server inside WSL.
+FALLBACK_HOSTPORT = _get("ServerHostPort", "127.0.0.1:8087")
+
+MAX_LINE_ATTEMPTS = 3
 
 WEM_SLOTS = [f"{i:08X}" for i in range(0x00666A79, 0x00666A79 + 200)]
 
@@ -74,13 +118,74 @@ def next_slot():
     return slot
 
 
+_server_hostport = None
+
+
 def discover_server():
-    # Discovery is currently failing in your logs and costs ~3 seconds per turn.
-    # Use the known UNITY server directly for now.
+    """Ask the Dwemer launcher's discovery service once, cache the answer.
+    Short timeout so a missing launcher costs ~1s once, not every turn."""
+    global _server_hostport
+    if _server_hostport:
+        return _server_hostport
+    try:
+        with urllib.request.urlopen(DISCOVERY_URL, timeout=1.5) as r:
+            body = r.read().decode("utf-8", errors="replace").strip()
+        hostport = None
+        try:
+            j = json.loads(body)
+            if isinstance(j, dict):
+                host = j.get("host") or j.get("ip") or j.get("address")
+                port = j.get("port")
+                if host and port:
+                    hostport = f"{host}:{port}"
+                elif isinstance(j.get("url"), str):
+                    body = j["url"]
+        except ValueError:
+            pass
+        if not hostport:
+            m = re.search(r"([A-Za-z0-9_.\-]+):(\d{2,5})", body)
+            if m:
+                hostport = f"{m.group(1)}:{m.group(2)}"
+        if hostport:
+            _server_hostport = hostport
+            log(f"server discovered: {hostport}")
+            return hostport
+        log(f"discovery returned unexpected '{body[:80]}', using {FALLBACK_HOSTPORT}")
+    except Exception as e:
+        log(f"discovery unavailable ({e.__class__.__name__}), using {FALLBACK_HOSTPORT}")
+    _server_hostport = FALLBACK_HOSTPORT
     return FALLBACK_HOSTPORT
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat - lets the plugin tell the player in game when this watcher isn't
+# running or is misconfigured (see UpdateStatus in main.cpp). Written from its
+# own thread so a long WwiseConsole/ffxc run never makes us look dead.
+# ---------------------------------------------------------------------------
+_startup_problems = ""      # e.g. "missing LipGenerator, ffxc"
+_fetch_problem = ""         # set while audio downloads from the server are failing
+
+
+def _write_heartbeat():
+    import ctypes
+    W = ctypes.windll.kernel32.WritePrivateProfileStringA
+    path = HEARTBEAT_INI.encode("mbcs", "replace")
+    problems = "; ".join(p for p in (_startup_problems, _fetch_problem) if p)
+    W(b"watcher", b"heartbeat", str(int(time.time())).encode(), path)
+    W(b"watcher", b"problems", problems.encode("ascii", "replace"), path)
+
+
+def _heartbeat_loop():
+    while True:
+        try:
+            _write_heartbeat()
+        except Exception as e:
+            log(f"heartbeat write failed: {e}")
+        time.sleep(2.0)
+
+
 def fetch_wav(hostport, hash_, dest):
+    global _fetch_problem
     url = f"http://{hostport}/UNITYServer/soundcache/{hash_}.wav"
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
@@ -90,9 +195,11 @@ def fetch_wav(hostport, hash_, dest):
             return False
         with open(dest, "wb") as f:
             f.write(data)
+        _fetch_problem = ""
         return True
     except Exception as e:
         log(f"  fetch failed for {hash_}: {e}")
+        _fetch_problem = f"can't download audio from {hostport}"
         return False
 
 
@@ -413,19 +520,19 @@ def build_lipsync(wav_path, slot, voice_folder, subtitle):
 
 def deploy_ffxanim(ffxanim_src, voice_folder, slot):
     dest_mo2 = None
-    for base in (MO2_VOICE_BASE, DATA_VOICE_BASE):
+    for base in VOICE_BASES:
         dest_dir = os.path.join(base, voice_folder)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, f"{slot}.ffxanim")
         shutil.copyfile(ffxanim_src, dest)
         log(f"  deployed {slot}.ffxanim -> {dest}")
-        if base == MO2_VOICE_BASE:
+        if dest_mo2 is None:
             dest_mo2 = dest
     return dest_mo2
 
 
 def remove_stale_ffxanim(voice_folder, slot):
-    for base in (MO2_VOICE_BASE, DATA_VOICE_BASE):
+    for base in VOICE_BASES:
         ffx = os.path.join(base, voice_folder, f"{slot}.ffxanim")
         try:
             if os.path.exists(ffx):
@@ -438,14 +545,14 @@ def remove_stale_ffxanim(voice_folder, slot):
 def deploy_wem(wem_path, voice_folder, slot):
     remove_stale_ffxanim(voice_folder, slot)
 
-    for base in (MO2_VOICE_BASE, DATA_VOICE_BASE):
+    for base in VOICE_BASES:
         dest_dir = os.path.join(base, voice_folder)
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, f"{slot}.wem")
         shutil.copyfile(wem_path, dest)
         log(f"  deployed {slot}.wem -> {dest}")
 
-    return os.path.join(MO2_VOICE_BASE, voice_folder, f"{slot}.wem")
+    return os.path.join(VOICE_BASES[0], voice_folder, f"{slot}.wem")
 
 
 def estimate_duration(wav_path):
@@ -483,13 +590,34 @@ def estimate_duration(wav_path):
 
 
 def read_write_index():
-    import configparser
-    cfg = configparser.ConfigParser()
-    cfg.read(QUEUE_INI)
+    """[queue] write_index from MantellaQueue.ini.
+
+    Parsed from raw bytes on purpose. The file holds subtitles written as
+    UTF-8, and configparser decodes with the Windows locale codepage
+    (cp1252), which has no mapping for bytes 0x81/0x8D/0x8F/0x90/0x9D. A
+    subtitle containing e.g. "Á" or "č" made cfg.read() raise before this
+    function's try block, the exception escaped to main()'s loop, the line
+    was never marked consumed, and the watcher re-processed that same line
+    forever - silently wedging all voice output for the session."""
     try:
-        return cfg.getint("queue", "write_index")
-    except Exception:
+        with open(QUEUE_INI, "rb") as f:
+            data = f.read()
+    except OSError:
         return 0
+    in_queue = False
+    for raw in data.splitlines():
+        line = raw.strip()
+        if line.startswith(b"["):
+            in_queue = line.lower() == b"[queue]"
+            continue
+        if in_queue and b"=" in line:
+            k, v = line.split(b"=", 1)
+            if k.strip().lower() == b"write_index":
+                try:
+                    return int(v.strip())
+                except ValueError:
+                    return 0
+    return 0
 
 
 def reset_queue():
@@ -588,12 +716,29 @@ def read_work_lines():
 
 
 def main():
+    global _startup_problems
     os.makedirs(SCRATCH, exist_ok=True)
     os.makedirs(os.path.dirname(WORK_FILE), exist_ok=True)
 
     if not os.path.exists(WORK_FILE):
         open(WORK_FILE, "w", encoding="utf-8").close()
 
+    log(f"config: {CONFIG_PATH} ({'found' if os.path.exists(CONFIG_PATH) else 'NOT FOUND - using defaults'})")
+    missing = [(n, p) for n, p in (
+        ("StarfieldDir", STARFIELD_DIR), ("WwiseConsole", WWISE_CONSOLE), ("Wwise project", WWISE_PROJ),
+        ("LipGenerator", LIPGENERATOR_EXE), ("ffxc", FFXC_EXE), ("FaceFX female actor", FACEFX_FEMALE),
+        ("FaceFX male actor", FACEFX_MALE), ("FaceFX analysis actor", FACEFX_ANALYSIS),
+    ) if not os.path.exists(p)]
+    for n, p in missing:
+        log(f"WARNING: {n} not found at {p}")
+    if missing:
+        log("WARNING: voice/lip generation will fail until the paths above are fixed in the config")
+        _startup_problems = "missing " + ", ".join(n for n, _ in missing) + " - check unity_wem_gen.ini"
+    os.makedirs(BRIDGE_DIR, exist_ok=True)
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    log(f"heartbeat -> {HEARTBEAT_INI}")
+    for b in VOICE_BASES:
+        log(f"voice output -> {b}")
     log(f"watching {WORK_FILE}")
     log(f"queue -> {QUEUE_INI}")
     log(f"wem slots: {len(WEM_SLOTS)}")
@@ -605,6 +750,8 @@ def main():
     consumed = len(read_work_lines())
     log(f"starting after existing work lines: consumed={consumed}")
 
+    line_failures = {}  # work-line index -> failed attempts
+
     while True:
         try:
             lines = read_work_lines()
@@ -615,6 +762,7 @@ def main():
             if len(lines) < consumed:
                 log("work file was truncated; resetting consumed counter")
                 consumed = 0
+                line_failures.clear()
 
             if len(lines) > consumed:
                 hostport = discover_server()
@@ -635,14 +783,27 @@ def main():
 
                     log(f"processing {hash_.strip()} voice={voice_folder.strip()} speaker_name={speaker_name.strip()}")
 
-                    process_line(
-                        hostport,
-                        hash_.strip(),
-                        voice_folder.strip(),
-                        subtitle,
-                        speaker_name.strip(),
-                    )
+                    try:
+                        process_line(
+                            hostport,
+                            hash_.strip(),
+                            voice_folder.strip(),
+                            subtitle,
+                            speaker_name.strip(),
+                        )
+                    except Exception as e:
+                        # One bad line must never wedge the watcher. Before,
+                        # an exception here skipped the consumed += 1 below,
+                        # so the same line was retried every second forever.
+                        failures = line_failures.get(consumed, 0) + 1
+                        line_failures[consumed] = failures
+                        if failures < MAX_LINE_ATTEMPTS:
+                            log(f"  error on this line (attempt {failures}/{MAX_LINE_ATTEMPTS}): {e!r} - retrying")
+                            time.sleep(1.0)
+                            break  # re-read the work file and retry this line
+                        log(f"  giving up on this line after {failures} attempts: {e!r}")
 
+                    line_failures.pop(consumed, None)
                     consumed += 1
 
             time.sleep(0.25)

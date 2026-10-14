@@ -2,8 +2,8 @@
 #define NOMINMAX
 
 #include <windows.h>
-#include <winhttp.h>
 #include <mmsystem.h>
+#include <winver.h>
 
 #undef ERROR
 
@@ -17,6 +17,7 @@
 #include <cctype>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -31,15 +32,110 @@
 #include "UnityChat.h"
 #include "UnityComm.h"
 
-#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "version.lib")
 
-static const char* BRIDGE_DIR = "E:\\Star Wars Genesis\\Game\\overwrite\\SFSE\\MantellaStarfield\\";
-static const char* BRIDGE_INI = "E:\\Star Wars Genesis\\Game\\overwrite\\SFSE\\MantellaStarfield\\Bridge.ini";
+// Shown in the in-game status line and the log. Bump for each build you hand out.
+static constexpr const char* kPluginVersion = "0.1.0";
+// The Wwise path/cookie hook offsets below are for this game version only.
+static constexpr const char* kSupportedGameVersion = "1.16.244";
+
+// --- Path configuration ---
+// Nothing here is machine-specific any more. Everything resolves from the
+// GAME folder (the folder containing Starfield.exe, found via
+// GetModuleFileNameA(nullptr)), which is also what Papyrus's relative
+// ".\\Data\\SFSE\\MantellaStarfield\\" path resolves against. That matters
+// for MO2: inside the game process MO2's virtual filesystem maps
+// <game>\Data\SFSE\MantellaStarfield\ onto <MO2>\overwrite\SFSE\MantellaStarfield\,
+// so the plugin and Papyrus land in the same real folder with zero config,
+// whether or not MO2 is used. Only the Python watcher (which runs OUTSIDE the
+// game and can't see MO2's virtual Data) needs to be told the real folder.
+//
+// Optional overrides, in MantellaStarfield_Config.ini next to this DLL:
+//   [Paths]
+//   BridgeDir=...            ; default <game>\Data\SFSE\MantellaStarfield\ (trailing slash)
+//   VoiceDir1=...            ; default <game>\Data\Sound\Voice\MantellaStarfield.esp
+//   VoiceDir2=...            ; optional second voice base (e.g. the MO2 mod folder)
+// Populated once by LoadPathConfig() during SFSE_PLUGIN_LOAD.
+static std::string g_bridgeDir;
+static std::string g_bridgeIni;
 // Queue file — Python is the SOLE writer (write_index + [line_N] sections);
 // C++ is the sole reader. Separate file from Bridge.ini so the two processes
 // never write the same file (no read-modify-write race).
-static const char* QUEUE_INI = "E:\\Star Wars Genesis\\Game\\overwrite\\SFSE\\MantellaStarfield\\MantellaQueue.ini";
+static std::string g_queueIni;
+static const char* BRIDGE_DIR = nullptr;  // set to g_bridgeDir.c_str() by LoadPathConfig()
+static const char* BRIDGE_INI = nullptr;  // set to g_bridgeIni.c_str() by LoadPathConfig()
+static const char* QUEUE_INI = nullptr;   // set to g_queueIni.c_str() by LoadPathConfig()
+
+// Voice output bases ActivateLipsForCurrentLine() copies ffxanims into.
+static std::vector<std::string> g_voiceBases;
+// MantellaStarfield_Config.ini next to the DLL (may not exist - every key has a default).
+static std::filesystem::path g_configPath;
+
+static std::string ReadConfigString(const std::filesystem::path& configPath,
+                                    const char* key, const std::string& fallback)
+{
+    char buffer[MAX_PATH] = {};
+    GetPrivateProfileStringA("Paths", key, fallback.c_str(),
+                             buffer, sizeof(buffer), configPath.string().c_str());
+    return std::string(buffer);
+}
+
+static void LoadPathConfig()
+{
+    // This DLL's own folder (for the config file), resolved via an address
+    // inside this module so the DLL's filename doesn't matter.
+    char modulePath[MAX_PATH] = {};
+    HMODULE hSelf = nullptr;
+    GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCSTR>(&LoadPathConfig), &hSelf);
+    GetModuleFileNameA(hSelf, modulePath, MAX_PATH);
+    std::filesystem::path pluginDir = std::filesystem::path(modulePath).parent_path();
+    std::filesystem::path configPath = pluginDir / "MantellaStarfield_Config.ini";
+    g_configPath = configPath;
+
+    // The game folder (Starfield.exe's folder).
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::filesystem::path gameDir = std::filesystem::path(exePath).parent_path();
+
+    const std::string defaultBridgeDir = (gameDir / "Data" / "SFSE" / "MantellaStarfield").string() + "\\";
+    const std::string defaultVoiceDir  = (gameDir / "Data" / "Sound" / "Voice" / "MantellaStarfield.esp").string();
+
+    g_bridgeDir = ReadConfigString(configPath, "BridgeDir", defaultBridgeDir);
+    if (!g_bridgeDir.empty() && g_bridgeDir.back() != '\\' && g_bridgeDir.back() != '/') g_bridgeDir += '\\';
+    g_bridgeIni = g_bridgeDir + "Bridge.ini";
+    g_queueIni = g_bridgeDir + "MantellaQueue.ini";
+    BRIDGE_DIR = g_bridgeDir.c_str();
+    BRIDGE_INI = g_bridgeIni.c_str();
+    QUEUE_INI = g_queueIni.c_str();
+
+    std::error_code ec;
+    std::filesystem::create_directories(g_bridgeDir, ec);
+
+    g_voiceBases.clear();
+    std::string v1 = ReadConfigString(configPath, "VoiceDir1", defaultVoiceDir);
+    std::string v2 = ReadConfigString(configPath, "VoiceDir2", "");
+    if (!v1.empty()) g_voiceBases.push_back(v1);
+    if (!v2.empty() && v2 != v1) g_voiceBases.push_back(v2);
+
+    std::error_code existsErr;
+    const bool haveConfig = std::filesystem::exists(configPath, existsErr);
+    REX::INFO("Mantella: game folder '{}'", gameDir.string());
+    REX::INFO("Mantella: config file '{}' ({})", configPath.string(),
+              haveConfig ? "found" : "not found - using defaults");
+    REX::INFO("Mantella: Bridge directory resolved to '{}'{}", g_bridgeDir,
+              g_bridgeDir == defaultBridgeDir ? " (default)" : " (from config)");
+    for (const auto& b : g_voiceBases) {
+        REX::INFO("Mantella: voice base '{}'", b);
+    }
+}
+
+std::string GetBridgeDir()
+{
+    return g_bridgeDir;
+}
 
 static std::atomic<bool> g_conversationActive{ false };
 // Bumped every time a NEW conversation start is accepted. A running
@@ -91,6 +187,19 @@ static std::mutex g_activatedNpcsMutex;
 // Starfield both). Hardcoded guard, same as CHIM's Plugin.cpp check, so we
 // never accidentally activate the player as if they were an NPC.
 static constexpr std::uint32_t kPlayerFormID = 0x14;
+
+// FormIDs cross into Papyrus as decimal strings parsed with "as Int", and
+// Papyrus Int is SIGNED 32-bit. Any FormID >= 0x80000000 - light (ESL)
+// plugins (0xFE......), runtime-spawned references (0xFF......) - written as
+// an unsigned decimal ("4278190080") overflows that parse and resolves to the
+// wrong form or none. Writing the same 32 bits as a signed value
+// ("-16777216") round-trips exactly through Game.GetForm(). This is also the
+// form Papyrus itself writes (GetFormID() as String), which C++'s stoul
+// already reads back correctly.
+static std::string FormIdToPapyrusString(std::uint32_t formId)
+{
+    return std::to_string(static_cast<std::int32_t>(formId));
+}
 
 bool IsNpcActivated(std::uint32_t formId)
 {
@@ -181,7 +290,7 @@ void WriteFreeformRoster()
     for (std::size_t i = 0; i < g_activatedNpcs.size(); ++i) {
         const std::string formidKey = "formid_" + std::to_string(i);
         WritePrivateProfileStringA("freeform", formidKey.c_str(),
-            std::to_string(g_activatedNpcs[i].formId).c_str(), BRIDGE_INI);
+            FormIdToPapyrusString(g_activatedNpcs[i].formId).c_str(), BRIDGE_INI);
     }
 }
 
@@ -317,23 +426,167 @@ static DWORD g_lastBoredEventTick = 0;
 // not a replacement for one. 5s didn't match either architecture; it was
 // closer to "ask constantly" than anything either mature implementation
 // actually does.
-static constexpr DWORD kBoredEventIntervalMs = 60 * 1000;
+static DWORD kBoredEventIntervalMs = 60 * 1000;          // [Tuning] BoredIntervalSeconds
 
 // Per-NPC cooldown - the same activated NPC can't fire back-to-back bored
 // events even if the global interval above has elapsed and they're still
 // "least bored" (e.g. only one NPC is currently activated). Independent of
 // the probability-gate change above - this still serves its own purpose
 // (variety across multiple activated NPCs), not touched by this change.
-static constexpr DWORD kPerNpcBoredCooldownMs = 2 * 60 * 1000; // 2 minutes
+static DWORD kPerNpcBoredCooldownMs = 2 * 60 * 1000;     // [Tuning] BoredPerNpcCooldownSeconds
 
 // Search radius in game units. Ported from CHIM's DISTANCE_ACTIVATING_NPC_IN/OUT
 // at the same relative indoor/outdoor ratio, NOT measured against actual
 // Starfield distances - these are placeholders, almost certainly wrong as
 // absolute values. Tune once you can observe trigger behavior in-game.
-static constexpr float kBoredEventRadiusInterior = 2000.0f;
-static constexpr float kBoredEventRadiusExterior = 4000.0f;
+static float kBoredEventRadiusInterior = 2000.0f;        // [Tuning] BoredRadiusInterior
+static float kBoredEventRadiusExterior = 4000.0f;        // [Tuning] BoredRadiusExterior
 
-static std::atomic<bool> g_boredEventsEnabled{ true };
+static std::atomic<bool> g_boredEventsEnabled{ true };  // [Tuning] BoredEventsEnabled
+
+// Extra wait after each line's audio before the next line starts.
+static int g_playbackBufferMs = 700;                     // [Tuning] PlaybackBufferMs
+
+// -----------------------------------------------------------------------
+// Runtime config: [Keys] and [Tuning] in MantellaStarfield_Config.ini.
+//
+// Keys are resolved here and handed to Papyrus through Bridge.ini [keys],
+// because Papyrus properties are baked into saves - changing a default in
+// the .psc never reaches an existing save, and players shouldn't need the
+// Creation Kit to rebind a key. Papyrus re-applies [keys] on every load.
+// -----------------------------------------------------------------------
+
+static std::string TrimAscii(std::string v)
+{
+    const char* ws = " \t\r\n\"";
+    size_t a = v.find_first_not_of(ws);
+    if (a == std::string::npos) return "";
+    size_t b = v.find_last_not_of(ws);
+    return v.substr(a, b - a + 1);
+}
+
+static std::string ReadConfigValue(const char* section, const char* key)
+{
+    char buffer[256] = {};
+    GetPrivateProfileStringA(section, key, "", buffer, sizeof(buffer), g_configPath.string().c_str());
+    // Allow trailing ";" comments on the same line.
+    std::string v(buffer);
+    size_t semi = v.find(';');
+    if (semi != std::string::npos) v = v.substr(0, semi);
+    return TrimAscii(v);
+}
+
+// Accepts a key name ("G", "F6", "NumpadMinus", "Delete"), a hex code
+// ("0x47") or a decimal code ("71"). Codes are Windows virtual-key codes,
+// which is what CassiopeiaPapyrusExtender's BSInputEvent has reported for
+// every key tested so far (letters, Delete, Escape, Numpad Minus) - with one
+// known exception: Numpad Plus came through as 18 (Alt). So prefer letters
+// and F-keys, and test anything exotic in game.
+static int ParseKeyName(const std::string& raw, int fallback, const char* settingName)
+{
+    std::string v = TrimAscii(raw);
+    if (v.empty()) return fallback;
+    std::string u = v;
+    std::transform(u.begin(), u.end(), u.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    u.erase(std::remove(u.begin(), u.end(), ' '), u.end());
+
+    try {
+        if (u.rfind("0X", 0) == 0) return std::stoi(u.substr(2), nullptr, 16);
+        if (std::all_of(u.begin(), u.end(), [](unsigned char c) { return std::isdigit(c); }) && u.size() > 1)
+            return std::stoi(u);
+    } catch (...) {}
+
+    if (u.size() == 1 && ((u[0] >= 'A' && u[0] <= 'Z') || (u[0] >= '0' && u[0] <= '9'))) return u[0];
+    if (u.size() >= 2 && u.size() <= 3 && u[0] == 'F') {
+        try { int n = std::stoi(u.substr(1)); if (n >= 1 && n <= 24) return 0x70 + n - 1; } catch (...) {}
+    }
+    if (u.rfind("NUMPAD", 0) == 0 && u.size() == 7 && std::isdigit(static_cast<unsigned char>(u[6]))) return 0x60 + (u[6] - '0');
+
+    static const std::pair<const char*, int> kNamed[] = {
+        {"NUMPADMINUS", 0x6D}, {"NUMPADSUBTRACT", 0x6D}, {"NUMPADPLUS", 0x6B}, {"NUMPADADD", 0x6B},
+        {"NUMPADMULTIPLY", 0x6A}, {"NUMPADDIVIDE", 0x6F}, {"NUMPADDECIMAL", 0x6E}, {"NUMPADPERIOD", 0x6E},
+        {"DELETE", 0x2E}, {"DEL", 0x2E}, {"INSERT", 0x2D}, {"INS", 0x2D}, {"HOME", 0x24}, {"END", 0x23},
+        {"PAGEUP", 0x21}, {"PAGEDOWN", 0x22}, {"ESCAPE", 0x1B}, {"ESC", 0x1B}, {"TAB", 0x09},
+        {"BACKSPACE", 0x08}, {"ENTER", 0x0D}, {"RETURN", 0x0D}, {"SPACE", 0x20}, {"CAPSLOCK", 0x14},
+        {"UP", 0x26}, {"DOWN", 0x28}, {"LEFT", 0x25}, {"RIGHT", 0x27},
+        {"GRAVE", 0xC0}, {"TILDE", 0xC0}, {"MINUS", 0xBD}, {"EQUALS", 0xBB}, {"LEFTBRACKET", 0xDB},
+        {"RIGHTBRACKET", 0xDD}, {"SEMICOLON", 0xBA}, {"APOSTROPHE", 0xDE}, {"COMMA", 0xBC},
+        {"PERIOD", 0xBE}, {"SLASH", 0xBF}, {"BACKSLASH", 0xDC},
+    };
+    for (const auto& [name, code] : kNamed) {
+        if (u == name) return code;
+    }
+    REX::INFO("Mantella: WARNING: [Keys] {}='{}' not recognised - keeping default 0x{:X}", settingName, raw, fallback);
+    return fallback;
+}
+
+struct KeySetting { const char* configKey; const char* bridgeKey; int defaultCode; };
+static const KeySetting kKeySettings[] = {
+    // configKey          bridgeKey    default (matches the .psc property defaults)
+    { "Talk",             "talk",      0x47 },  // G
+    { "AddMoreText",      "continue",  0x54 },  // T
+    { "EndConversation",  "end",       0x1B },  // Escape
+    { "RenameNpc",        "rename",    0x4E },  // N
+    { "ToggleActivation", "activate",  0x6D },  // Numpad Minus
+    { "TalkToNearest",    "nearest",   0x2E },  // Delete
+    { "PushToTalk",       "voice",     0x56 },  // V
+};
+
+static void LoadRuntimeConfig()
+{
+    // [Tuning]
+    auto readInt = [](const char* key, long long fallback) -> long long {
+        std::string v = ReadConfigValue("Tuning", key);
+        if (v.empty()) return fallback;
+        try { return std::stoll(v); } catch (...) {
+            REX::INFO("Mantella: WARNING: [Tuning] {}='{}' is not a number - using {}", key, v, fallback);
+            return fallback;
+        }
+    };
+    auto readFloat = [](const char* key, float fallback) -> float {
+        std::string v = ReadConfigValue("Tuning", key);
+        if (v.empty()) return fallback;
+        try { return std::stof(v); } catch (...) {
+            REX::INFO("Mantella: WARNING: [Tuning] {}='{}' is not a number - using {}", key, v, fallback);
+            return fallback;
+        }
+    };
+    kBoredEventIntervalMs = static_cast<DWORD>(std::max<long long>(5, readInt("BoredIntervalSeconds", 60)) * 1000);
+    kPerNpcBoredCooldownMs = static_cast<DWORD>(std::max<long long>(0, readInt("BoredPerNpcCooldownSeconds", 120)) * 1000);
+    kBoredEventRadiusInterior = readFloat("BoredRadiusInterior", 2000.0f);
+    kBoredEventRadiusExterior = readFloat("BoredRadiusExterior", 4000.0f);
+    g_boredEventsEnabled.store(readInt("BoredEventsEnabled", 1) != 0);
+    g_playbackBufferMs = static_cast<int>(std::clamp<long long>(readInt("PlaybackBufferMs", 700), 0, 5000));
+    REX::INFO("Mantella: tuning - bored events {} every {}s (per-NPC cooldown {}s, radius {}/{}), playback buffer {}ms",
+              g_boredEventsEnabled.load() ? "on" : "off", kBoredEventIntervalMs / 1000, kPerNpcBoredCooldownMs / 1000,
+              kBoredEventRadiusInterior, kBoredEventRadiusExterior, g_playbackBufferMs);
+
+    // [Keys] -> Bridge.ini [keys]
+    std::string summary;
+    for (const auto& k : kKeySettings) {
+        int code = ParseKeyName(ReadConfigValue("Keys", k.configKey), k.defaultCode, k.configKey);
+        WritePrivateProfileStringA("keys", k.bridgeKey, std::to_string(code).c_str(), BRIDGE_INI);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%s%s=0x%X", summary.empty() ? "" : ", ", k.configKey, code);
+        summary += buf;
+    }
+    // [Experimental] DeliveryMode: "scene" (default) or "say". In "say" mode
+    // Papyrus plays each line with ObjectReference.Say() instead of starting a
+    // scene - see DeliverLineWithSay in the .psc. Applied with the keys below.
+    std::string delivery = ReadConfigValue("Experimental", "DeliveryMode");
+    std::transform(delivery.begin(), delivery.end(), delivery.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (delivery != "say") delivery = "scene";
+    WritePrivateProfileStringA("settings", "delivery", delivery.c_str(), BRIDGE_INI);
+    REX::INFO("Mantella: line delivery mode - {}", delivery);
+
+    // Bridge.ini outlives the game session - drop last session's status so a
+    // stale "UNITY ready" can't show before this session's first real check.
+    WritePrivateProfileStringA("status", "message", "", BRIDGE_INI);
+
+    // Papyrus re-applies keys whenever this changes (i.e. once per game launch).
+    WritePrivateProfileStringA("keys", "version", std::to_string(GetTickCount64()).c_str(), BRIDGE_INI);
+    REX::INFO("Mantella: keys - {}", summary);
+}
 
 // Guards against two PlayBoredEventQueue threads running concurrently.
 // Confirmed as a real bug in-game: a zero-line bored event (no listener
@@ -648,7 +901,7 @@ void MaybeTriggerBoredEvent()
     // round-tripped through the server. Different name source, evidently
     // not guaranteed to produce an identical string. FormID sidesteps the
     // whole problem: no string matching needed at all.
-    WritePrivateProfileStringA("bored", "speaker_formid", std::to_string(candidate->formId).c_str(), BRIDGE_INI);
+    WritePrivateProfileStringA("bored", "speaker_formid", FormIdToPapyrusString(candidate->formId).c_str(), BRIDGE_INI);
     WritePrivateProfileStringA("bored", "nonce", std::to_string(boredNonce).c_str(), BRIDGE_INI);
 
     {
@@ -676,9 +929,6 @@ static std::mutex g_wemPathMutex;
 // Redirected path buffer
 static char g_redirectedPathBuf[2048]{};
 
-// Current subtitle text — updated from bridge INI before each line
-static std::string g_currentSubtitleText;
-static std::mutex g_subtitleMutex;
 
 void PatchDialogueSubtitle(const std::string& text)
 {
@@ -849,104 +1099,9 @@ std::string BuildActivatedRosterPeopleParam()
     return json;
 }
 
-std::string GetReplyType(const std::string& jsonResponse)
-{
-    std::string key = "\"mantella_reply_type\":\"";
-    size_t pos = jsonResponse.find(key);
-    if (pos == std::string::npos) return "";
-    pos += key.length();
-    size_t end = jsonResponse.find("\"", pos);
-    if (end == std::string::npos) return "";
-    return jsonResponse.substr(pos, end - pos);
-}
-
-std::string SendToMantella(const std::string& jsonBody)
-{
-    HINTERNET hSession = WinHttpOpen(L"MantellaStarfield/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) { REX::ERROR("WinHttp: Failed to open session"); return ""; }
-    HINTERNET hConnect = WinHttpConnect(hSession, L"localhost", 4999, 0);
-    if (!hConnect) { REX::ERROR("WinHttp: Failed to connect"); WinHttpCloseHandle(hSession); return ""; }
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/mantella", nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-    if (!hRequest) {
-        REX::ERROR("WinHttp: Failed to open request");
-        WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return "";
-    }
-    std::wstring headers = L"Content-Type: application/json";
-    std::string body = jsonBody;
-    BOOL result = WinHttpSendRequest(hRequest, headers.c_str(), static_cast<DWORD>(-1),
-        (LPVOID)body.c_str(), static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0);
-    std::string response;
-    if (result) {
-        WinHttpReceiveResponse(hRequest, nullptr);
-        DWORD bytesAvailable = 0;
-        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
-            std::vector<char> buffer(bytesAvailable + 1, 0);
-            DWORD bytesRead = 0;
-            WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead);
-            response.append(buffer.data(), bytesRead);
-        }
-        REX::INFO("Mantella: Request sent, reply type: {}", GetReplyType(response));
-    } else {
-        REX::ERROR("Mantella: Failed to send request");
-    }
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return response;
-}
-
-std::string BuildStartJson(const std::string& speaker)
-{
-    std::string safeSpeaker = EscapeJson(speaker.empty() ? "Unknown" : speaker);
-    std::string location = ReadIniValue("request", "location", "Unknown Location");
-    std::string hourStr = ReadIniValue("request", "hour", "12");
-    std::string gamedaysStr = ReadIniValue("request", "gamedays", "1.0");
-    if (location.empty()) location = "Unknown Location";
-    int hour = 12; float gamedays = 1.0f;
-    try { hour = std::stoi(hourStr); } catch (...) {}
-    try { gamedays = std::stof(gamedaysStr); } catch (...) {}
-    std::string safeLocation = EscapeJson(location);
-    std::ostringstream json;
-    json << "{"
-        << "\"mantella_request_type\":\"mantella_start_conversation\","
-        << "\"mantella_worldid\":\"starfield\","
-        << "\"mantella_actors\":["
-        << "{\"mantella_actor_baseid\":0,\"mantella_actor_refid\":0,\"mantella_actor_name\":\"" << safeSpeaker << "\","
-        << "\"mantella_actor_gender\":0,\"mantella_actor_race\":\"HumanRace\",\"mantella_actor_voicetype\":\"Unknown\","
-        << "\"mantella_actor_is_in_combat\":false,\"mantella_actor_is_enemy\":false,\"mantella_actor_relationshiprank\":0,\"mantella_actor_is_player\":false},"
-        << "{\"mantella_actor_baseid\":1,\"mantella_actor_refid\":1,\"mantella_actor_name\":\"Player\","
-        << "\"mantella_actor_gender\":0,\"mantella_actor_race\":\"HumanRace\",\"mantella_actor_voicetype\":\"Unknown\","
-        << "\"mantella_actor_is_in_combat\":false,\"mantella_actor_is_enemy\":false,\"mantella_actor_relationshiprank\":4,\"mantella_actor_is_player\":true}"
-        << "],"
-        << "\"mantella_context\":{\"mantella_location\":\"" << safeLocation << "\","
-        << "\"mantella_time\":" << hour << ",\"mantella_gamedays\":" << gamedays << ",\"mantella_weather\":{}}"
-        << "}";
-    return json.str();
-}
-
-std::string BuildContinueJson()
-{
-    return "{\"mantella_request_type\":\"mantella_continue_conversation\",\"mantella_topicinfofile\":1,\"mantella_context\":{}}";
-}
-
-std::string BuildPlayerInputJson(const std::string& playerInput)
-{
-    std::string processed = playerInput;
-    std::replace(processed.begin(), processed.end(), '_', ' ');
-    std::string safeInput = EscapeJson(processed);
-    std::ostringstream json;
-    json << "{\"mantella_request_type\":\"mantella_player_input\","
-        << "\"mantella_player_input\":\"" << safeInput << "\","
-        << "\"mantella_context\":{}}";
-    return json.str();
-}
-
-std::string BuildEndJson()
-{
-    return "{\"mantella_request_type\":\"mantella_end_conversation\"}";
-}
+// (Removed: the original Mantella client - SendToMantella() posting to
+// localhost:4999 plus its start/continue/player-input/end JSON builders.
+// Nothing called any of it after the UNITYServer port; see git history.)
 
 void WriteAwaitInput(const std::string& lastNonce)
 {
@@ -982,11 +1137,6 @@ void SetCurrentWemPath(const std::string& wemPath)
     REX::INFO("Mantella: Current wem path set to: {}", wemPath);
 }
 
-
-static const char* MO2_VOICE_BASE_CPP =
-    "E:\\Star Wars Genesis\\Game\\mods\\MantellaStarfield\\Sound\\Voice\\MantellaStarfield.esp";
-static const char* DATA_VOICE_BASE_CPP =
-    "E:\\SteamLibrary\\steamapps\\common\\Starfield\\Data\\Sound\\Voice\\MantellaStarfield.esp";
 
 // Activate the lips for the line that is about to play.
 //
@@ -1079,8 +1229,8 @@ void ActivateLipsForCurrentLine()
     // 1) The line's own folder (covers named NPCs reading their own folder).
     copyAndVerify(wem.parent_path() / "00666A79.ffxanim");
 
-    // 2) All generic + registered folders under both MO2 and Data bases.
-    for (const auto& base : { MO2_VOICE_BASE_CPP, DATA_VOICE_BASE_CPP }) {
+    // 2) All generic + registered folders under every configured voice base.
+    for (const auto& base : g_voiceBases) {
         for (const auto& folder : folders) {
             fs::path dst = fs::path(base) / folder / "00666A79.ffxanim";
             std::error_code e2;
@@ -1136,7 +1286,7 @@ void PlayQueuedLine(int idx)
     // Buffer added to the line's duration before advancing. Covers two timing
     // offsets that otherwise let the NEXT line's lip activation overwrite the
     // shared 00666A79.ffxanim slot before THIS line's audio finishes.
-    static const int PLAYBACK_BUFFER_MS = 700;
+    const int PLAYBACK_BUFFER_MS = g_playbackBufferMs;  // [Tuning] PlaybackBufferMs
 
     int waitMs = static_cast<int>(duration * 1000.0f) + PLAYBACK_BUFFER_MS;
 
@@ -1174,7 +1324,7 @@ void PlayQueuedLine(int idx)
     REX::INFO("Mantella: Resolved speaker_formid=0x{:X} for speaker_name='{}' (current g_currentSpeakerFormID=0x{:X})",
               speakerFormId, speakerName, g_currentSpeakerFormID.load());
     WritePrivateProfileStringA("speaking", "speaker_formid",
-        std::to_string(speakerFormId).c_str(), BRIDGE_INI);
+        FormIdToPapyrusString(speakerFormId).c_str(), BRIDGE_INI);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
 
@@ -1252,6 +1402,7 @@ void RunConversationLoop(const std::string& startNonce, std::uint64_t myGenerati
 
             if (currentType == "end") {
                 REX::INFO("UNITY: Player ended conversation");
+                CancelPendingChats();
                 g_conversationActive = false;
                 g_mantellaSpeaking.store(false);
                 return;
@@ -1400,7 +1551,7 @@ void VoiceRecordThread(int voiceKeyCode)
     wfx.nAvgBytesPerSec = wfx.nBlockAlign * wfx.nSamplesPerSec;
 
     HWAVEIN wi = nullptr;
-    if (waveInOpen(&wi, WAVE_MAPPER, &wfx, NULL, NULL, CALLBACK_NULL | WAVE_FORMAT_DIRECT) != MMSYSERR_NOERROR) {
+    if (waveInOpen(&wi, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL | WAVE_FORMAT_DIRECT) != MMSYSERR_NOERROR) {
         REX::ERROR("UNITY: voice recording failed to open capture device");
         g_voiceRecordingActive.store(false);
         g_voiceStopRequested.store(false);
@@ -1408,7 +1559,8 @@ void VoiceRecordThread(int voiceKeyCode)
     }
 
     const int kBufferCount = 8;
-    const int kBufferSize = 16000 * 2 / 8; // 0.5s of 16-bit mono @ 16kHz, matches CHIM
+    const int kBufferSize = 16000 * 2 / 8; // 4000 bytes = 0.125s of 16-bit mono @ 16kHz (matches CHIM's buffer size)
+    const long kBufferMs = static_cast<long>(kBufferSize) * 1000 / static_cast<long>(wfx.nAvgBytesPerSec); // 125
     std::vector<std::vector<char>> buffers(kBufferCount, std::vector<char>(kBufferSize));
     std::vector<WAVEHDR> headers(kBufferCount);
     for (int i = 0; i < kBufferCount; ++i) {
@@ -1483,10 +1635,13 @@ void VoiceRecordThread(int voiceKeyCode)
                     }
                 }
                 if (silentChunk) {
-                    silenceMs += 250;
+                    // Was a flat +250 per buffer, but each buffer is 125ms,
+                    // so recording cut off after ~2s of silence, not 4s.
+                    silenceMs += kBufferMs;
                 } else {
                     silenceMs = 0;
                 }
+                h.dwBytesRecorded = 0;  // consumed - don't re-collect after waveInReset below
                 waveInPrepareHeader(wi, &h, sizeof(WAVEHDR));
                 waveInAddBuffer(wi, &h, sizeof(WAVEHDR));
             }
@@ -1495,7 +1650,19 @@ void VoiceRecordThread(int voiceKeyCode)
     }
 
     waveInStop(wi);
+    // waveInStop leaves unfilled buffers queued; unprepare/close both FAIL
+    // while buffers are still queued, which leaked the capture device on
+    // every recording. waveInReset returns every buffer (marked done) first.
+    // The partially-filled buffer at the moment of release is kept too, so
+    // the last word isn't clipped.
+    waveInReset(wi);
     for (auto& h : headers) {
+        if ((h.dwFlags & WHDR_DONE) && h.dwBytesRecorded > 0) {
+            short* data = reinterpret_cast<short*>(h.lpData);
+            size_t numSamples = h.dwBytesRecorded / sizeof(short);
+            audioData.insert(audioData.end(), data, data + numSamples);
+            h.dwBytesRecorded = 0;
+        }
         waveInUnprepareHeader(wi, &h, sizeof(WAVEHDR));
     }
     waveInClose(wi);
@@ -1533,9 +1700,142 @@ void VoiceRecordThread(int voiceKeyCode)
     WritePrivateProfileStringA("voice", "nonce", std::to_string(nonce).c_str(), BRIDGE_INI);
 }
 
+// -----------------------------------------------------------------------
+// Game version check + in-game status line.
+//
+// Most "nothing happens" reports come down to setup, not code: the Python
+// watcher isn't running, the server isn't up, or the game version doesn't
+// match the hook offsets. The plugin sums that up in Bridge.ini [status]
+// "message" and rewrites it only when it changes; Papyrus shows each new
+// message once as a notification (and again after every load).
+// -----------------------------------------------------------------------
+static std::string g_gameVersion = "unknown";
+static bool g_gameVersionSupported = true;
+static std::string g_hookStatus = "not installed";   // "ok" | "skipped" | "failed"
+
+static std::string ReadGameVersion()
+{
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    DWORD ignored = 0;
+    DWORD size = GetFileVersionInfoSizeA(exePath, &ignored);
+    if (size == 0) return "unknown";
+    std::vector<char> data(size);
+    if (!GetFileVersionInfoA(exePath, 0, size, data.data())) return "unknown";
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueA(data.data(), "\\", reinterpret_cast<void**>(&info), &len) || !info) return "unknown";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+             HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+             HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    return buf;
+}
+
+static bool IsSupportedGameVersion(const std::string& version)
+{
+    const std::string supported = kSupportedGameVersion;
+    return version == supported || version.rfind(supported + ".", 0) == 0;
+}
+
+// 0 = not checked yet, 1 = reachable, 2 = unreachable
+static std::atomic<int> g_serverState{ 0 };
+static std::atomic<bool> g_serverCheckRunning{ false };
+static DWORD g_lastServerCheckTick = 0;
+
+static void StartServerCheckIfDue()
+{
+    DWORD now = GetTickCount();
+    bool due = g_serverState.load() == 0 || (now - g_lastServerCheckTick) > 30000;
+    if (!due || g_serverCheckRunning.exchange(true)) return;
+    g_lastServerCheckTick = now;
+    // Own thread: an unreachable host can block for the full HTTP timeout,
+    // and the bridge monitor loop must keep polling meanwhile.
+    std::thread([] {
+        PostToUnityWithResponse(L"/UNITYServer/", "");  // any HTTP response counts as reachable
+        g_serverState.store(IsDwemerDistroConnected() ? 1 : 2);
+        g_serverCheckRunning.store(false);
+    }).detach();
+}
+
+// Reads the heartbeat file unity_wem_gen.py rewrites every couple of seconds.
+// Returns 0 = running, 1 = not running, 2 = running but reports problems.
+static int ReadWatcherState(std::string& problems)
+{
+    const std::string path = g_bridgeDir + "UnityWatcher.ini";
+    char buf[512] = {};
+    GetPrivateProfileStringA("watcher", "heartbeat", "", buf, sizeof(buf), path.c_str());
+    long long beat = 0;
+    try { beat = std::stoll(buf); } catch (...) { beat = 0; }
+    long long now = static_cast<long long>(time(nullptr));
+    if (beat == 0 || now - beat > 15) return 1;
+    char pbuf[512] = {};
+    GetPrivateProfileStringA("watcher", "problems", "", pbuf, sizeof(pbuf), path.c_str());
+    problems = TrimAscii(pbuf);
+    return problems.empty() ? 0 : 2;
+}
+
+static std::string g_lastStatusMessage;
+static DWORD g_lastStatusTick = 0;
+
+static void UpdateStatus()
+{
+    DWORD now = GetTickCount();
+    if (g_lastStatusTick != 0 && now - g_lastStatusTick < 2000) return;
+    g_lastStatusTick = now;
+
+    StartServerCheckIfDue();
+
+    std::vector<std::string> problems;
+    if (!g_gameVersionSupported) {
+        problems.push_back("Starfield " + g_gameVersion + " is not supported (needs " +
+                           kSupportedGameVersion + ") - voices disabled");
+    } else if (g_hookStatus != "ok") {
+        problems.push_back("voice hooks failed to install - voices disabled");
+    }
+    const int server = g_serverState.load();
+    if (server == 2) {
+        problems.push_back("server not reachable at " + GetUnityServerHomeUrl());
+    }
+    std::string watcherProblems;
+    const int watcher = ReadWatcherState(watcherProblems);
+    if (watcher == 1) {
+        problems.push_back("voice watcher not running (start unity_wem_gen.py)");
+    } else if (watcher == 2) {
+        problems.push_back("voice watcher: " + watcherProblems);
+    }
+
+    std::string message;
+    if (!problems.empty()) {
+        message = "UNITY: ";
+        for (size_t i = 0; i < problems.size(); ++i) {
+            if (i) message += "; ";
+            message += problems[i];
+        }
+    } else if (server == 1) {
+        message = "UNITY ready";   // only once the first server check has actually passed
+    }
+    if (message.empty() || message == g_lastStatusMessage) return;
+    g_lastStatusMessage = message;
+
+    WritePrivateProfileStringA("status", "plugin_version", kPluginVersion, BRIDGE_INI);
+    WritePrivateProfileStringA("status", "game_version", g_gameVersion.c_str(), BRIDGE_INI);
+    WritePrivateProfileStringA("status", "hooks", g_hookStatus.c_str(), BRIDGE_INI);
+    WritePrivateProfileStringA("status", "server", server == 1 ? "ok" : server == 2 ? "unreachable" : "checking", BRIDGE_INI);
+    WritePrivateProfileStringA("status", "watcher", watcher == 0 ? "ok" : watcher == 1 ? "not running" : "problems", BRIDGE_INI);
+    WritePrivateProfileStringA("status", "message", message.c_str(), BRIDGE_INI);
+    REX::INFO("Mantella: status - {}", message);
+}
+
 void BridgeMonitorThread()
 {
-    std::filesystem::create_directories(BRIDGE_DIR);
+    // Non-throwing overloads: an unreachable path (e.g. a drive that no
+    // longer exists) must log, not crash the game. The Aug 2026 build used
+    // the throwing form with a hardcoded E:\ path and crashed on launch once
+    // the E: drive was gone.
+    std::error_code dirErr;
+    std::filesystem::create_directories(BRIDGE_DIR, dirErr);
+    if (dirErr) REX::ERROR("Mantella: cannot create bridge folder {} ({})", BRIDGE_DIR, dirErr.message());
     REX::INFO("Mantella: Bridge monitor started");
     REX::INFO("Mantella: Watching {}", BRIDGE_INI);
     std::string lastNonce;
@@ -1543,9 +1843,11 @@ void BridgeMonitorThread()
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+        UpdateStatus();
         MaybeTriggerBoredEvent();
 
-        if (!std::filesystem::exists(BRIDGE_INI)) continue;
+        std::error_code iniErr;
+        if (!std::filesystem::exists(BRIDGE_INI, iniErr)) continue;
 
         // Voice recording start/stop signals from Papyrus's BSInputEvent.
         // Deliberately checked BEFORE the [request] nonce-dedup below (and
@@ -1606,6 +1908,9 @@ void BridgeMonitorThread()
             // instead of potentially racing the new loop for writes to
             // Bridge.ini.
             std::uint64_t myGeneration = g_conversationGeneration.fetch_add(1) + 1;
+            // Stop any bored-event/rechat chain still generating lines, so
+            // they can't land in this conversation's queue.
+            CancelPendingChats();
             REX::INFO("UNITY: Conversation start, speaker={}, generation={}", speaker, myGeneration);
             // No Mantella start handshake in UNITY. Spawn the play-and-await loop
             // first (so it's ready to drain whatever the greeting stream enqueues),
@@ -1615,6 +1920,7 @@ void BridgeMonitorThread()
             std::thread(RunConversationLoop, nonce, myGeneration).detach();
         }
         else if (type == "end") {
+            CancelPendingChats();
             g_conversationActive = false;
             g_mantellaSpeaking.store(false);
             // Also bump generation on end: if a loop thread is currently
@@ -1633,6 +1939,7 @@ void BridgeMonitorThread()
             // conversation-end are equivalent: whatever conversation state
             // existed before this point is no longer valid.
             bool wasStuck = g_conversationActive.load();
+            CancelPendingChats();
             g_conversationActive = false;
             g_mantellaSpeaking.store(false);
             g_conversationGeneration.fetch_add(1);
@@ -1691,7 +1998,8 @@ void InstallVoiceHook()
     REX::INFO("Mantella: InstallVoiceHook called");
     auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA("Starfield.exe"));
     REX::INFO("Mantella: Base address: 0x{:X}", base);
-    if (!base) { REX::ERROR("Mantella: Failed to get base address"); return; }
+    if (!base) { REX::ERROR("Mantella: Failed to get base address"); g_hookStatus = "failed"; return; }
+    int hooksInstalled = 0;
     g_baseAddr = base;
 
     SFSE::AllocTrampoline(512);
@@ -1709,6 +2017,7 @@ void InstallVoiceHook()
             g_origPathBuild = reinterpret_cast<PathBuildFunc_t>(
                 trampoline.write_call<5>(addr, &HookedPathBuild));
             REX::INFO("Mantella: Path hook installed at 0x{:X}", addr);
+            hooksInstalled++;
         } else {
             REX::ERROR("Mantella: Path hook wrong byte 0x{:02X}", firstByte);
         }
@@ -1727,10 +2036,12 @@ void InstallVoiceHook()
             g_origHashFunc = reinterpret_cast<HashFunc_t>(
                 trampoline.write_call<5>(addr, &HookedHashFunc));
             REX::INFO("Mantella: Cookie hook installed at 0x{:X}", addr);
+            hooksInstalled++;
         } else {
             REX::ERROR("Mantella: Cookie hook wrong byte 0x{:02X}", firstByte);
         }
     }
+    g_hookStatus = (hooksInstalled == 2) ? "ok" : "failed";
 }
 
 SFSE_PLUGIN_PRELOAD(const SFSE::PreLoadInterface* a_sfse)
@@ -1742,11 +2053,27 @@ SFSE_PLUGIN_PRELOAD(const SFSE::PreLoadInterface* a_sfse)
 SFSE_PLUGIN_LOAD(const SFSE::LoadInterface* a_sfse)
 {
     SFSE::Init(a_sfse);
+    LoadPathConfig();
+    LoadRuntimeConfig();
     g_taskInterface = SFSE::GetTaskInterface();
     if (g_taskInterface) REX::INFO("Mantella: Task interface acquired");
     else REX::ERROR("Mantella: Failed to get task interface");
-    REX::INFO("Mantella Starfield bridge plugin loaded");
-    InstallVoiceHook();
+    REX::INFO("Mantella Starfield bridge plugin loaded (UNITY {})", kPluginVersion);
+
+    // The hook offsets are only valid for one game build. On any other build,
+    // skip them rather than patching random code, and say so in game.
+    g_gameVersion = ReadGameVersion();
+    const bool skipVersionCheck = ReadConfigValue("Compat", "SkipVersionCheck") == "1";
+    g_gameVersionSupported = skipVersionCheck || g_gameVersion == "unknown" || IsSupportedGameVersion(g_gameVersion);
+    REX::INFO("Mantella: game version {} (supported: {}{}{})", g_gameVersion, kSupportedGameVersion,
+              skipVersionCheck ? ", check skipped by config" : "",
+              g_gameVersion == "unknown" ? ", could not read version - assuming supported" : "");
+    if (g_gameVersionSupported) {
+        InstallVoiceHook();
+    } else {
+        g_hookStatus = "skipped";
+        REX::ERROR("Mantella: game version {} is not {} - voice hooks NOT installed", g_gameVersion, kSupportedGameVersion);
+    }
     std::thread(BridgeMonitorThread).detach();
 
     return true;

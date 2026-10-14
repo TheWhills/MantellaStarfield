@@ -17,6 +17,7 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 
 #undef ERROR  // REX::ERROR vs the windows.h ERROR macro
 
@@ -574,6 +575,11 @@ std::string PostAudioForTranscription(const std::string& wavBytes) {
          (responseText.back() == '\n' || responseText.back() == '\r' ||
           responseText.back() == ' ')) {
     responseText.pop_back();
+  }
+  // Newlines INSIDE the text break the Bridge.ini write the same way a
+  // leading one did (see above) - flatten them to spaces.
+  for (char& c : responseText) {
+    if (c == '\n' || c == '\r') c = ' ';
   }
   return responseText;
 }
